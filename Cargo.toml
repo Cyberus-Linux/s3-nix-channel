@@ -15,7 +15,7 @@ name = "s3-nix-channel-upload"
 anyhow = "1.0.104"
 arc-swap = "1.9.2"
 aws-config = { version = "1.11.0", features = ["behavior-version-latest", "default-https-client", "rt-tokio"], default-features = false }
-aws-sdk-s3 = "1.143.0"
+aws-sdk-s3 = { version = "1.143.0", default-features = false, features = ["default-https-client", "rt-tokio", "sigv4a"] }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "macros", "tokio", "tracing"] }
 base64 = "0.23.0"
 clap = { version = "4.6.6", default-features = false, features = ["derive", "help", "std", "usage"] }
