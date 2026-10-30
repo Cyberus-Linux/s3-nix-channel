@@ -5,10 +5,10 @@ use axum::{
 
 #[derive(thiserror::Error, Debug)]
 pub enum RequestError {
-    #[error("Failed to presign request for object {object_key:?}")]
-    PresignFailure { object_key: String },
-    #[error("Failed to create presign configuration")]
-    PresignConfigFailure,
+    #[error("Failed to fetch object {object_key:?}")]
+    BackendFailure { object_key: String },
+    #[error("There is no such object: {object_key:?}")]
+    NoSuchObject { object_key: String },
     #[error("There is no such channel: {file_name:?}")]
     NoSuchChannel { file_name: String },
 
@@ -24,12 +24,12 @@ impl IntoResponse for RequestError {
     fn into_response(self) -> axum::response::Response {
         (
             match self {
-                RequestError::NoSuchChannel { file_name: _ } => StatusCode::NOT_FOUND,
+                RequestError::NoSuchChannel { file_name: _ }
+                | RequestError::NoSuchObject { object_key: _ } => StatusCode::NOT_FOUND,
                 RequestError::InvalidToken { reason: _ } => StatusCode::FORBIDDEN,
                 RequestError::UnsupportedMethod { method: _ } => StatusCode::METHOD_NOT_ALLOWED,
-                RequestError::PresignConfigFailure
-                | RequestError::PresignFailure { object_key: _ }
-                | RequestError::Unknown => StatusCode::INTERNAL_SERVER_ERROR,
+                RequestError::BackendFailure { object_key: _ } => StatusCode::BAD_GATEWAY,
+                RequestError::Unknown => StatusCode::INTERNAL_SERVER_ERROR,
             },
             format!("{}", self),
         )
