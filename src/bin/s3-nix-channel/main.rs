@@ -3,8 +3,12 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 use anyhow::{anyhow, Context, Result};
 use arc_swap::ArcSwap;
 use axum::{
+    body::Body,
     extract::{Path, Request, State},
-    http::{header::LINK, HeaderMap, HeaderValue, Method, StatusCode},
+    http::{
+        header::{CONTENT_LENGTH, CONTENT_TYPE, ETAG, LAST_MODIFIED, LINK},
+        HeaderMap, HeaderValue, Method, StatusCode,
+    },
     middleware::{self, Next},
     response::{self, IntoResponse, Redirect},
     routing::get,
@@ -16,7 +20,10 @@ use tokio::time::interval;
 use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, warn};
 
-use s3_nix_channel::{error::RequestError, persistent::ChannelsConfig};
+use s3_nix_channel::{
+    error::RequestError,
+    persistent::{ChannelsConfig, Conditions, Fetched},
+};
 
 /// A program to serve a S3 bucket via the Nix Lockable Tarball Protocol.
 #[derive(Parser, Debug)]
@@ -62,7 +69,6 @@ struct Config {
 
 /// Redirect to the latest tarball of the requested channel.
 async fn handle_channel(
-    method: Method,
     Path(path): Path<String>,
     State(config): State<Arc<Config>>,
 ) -> Result<impl IntoResponse, RequestError> {
@@ -98,31 +104,26 @@ async fn handle_channel(
             file_name: path.clone(),
         })?;
 
+    let permanent_url = format!(
+        "{}/permanent/{latest_object}{}",
+        config.base_url, channel_config.file_extension
+    );
+
     let mut headers = HeaderMap::new();
 
     // The Lockable HTTP Tarball Protocol. See:
     // https://nix.dev/manual/nix/2.25/protocols/tarball-fetcher
     headers.insert(
         LINK,
-        HeaderValue::from_str(&format!(
-            "<{}/permanent/{latest_object}{}>; rel=\"immutable\"",
-            config.base_url, channel_config.file_extension
-        ))
-        .map_err(|_e| RequestError::Unknown)?,
+        HeaderValue::from_str(&format!("<{permanent_url}>; rel=\"immutable\""))
+            .map_err(|_e| RequestError::Unknown)?,
     );
 
-    Ok((
-        headers,
-        Redirect::temporary(
-            &config
-                .s3_client
-                .sign_request(
-                    method,
-                    &format!("{latest_object}{}", channel_config.file_extension),
-                )
-                .await?,
-        ),
-    ))
+    // We redirect to our own permanent URL instead of a pre-signed S3 URL.
+    // Tools that don't speak the Lockable HTTP Tarball Protocol (e.g. npins
+    // 0.5 and later) record the final URL after redirects. Pre-signed URLs
+    // expire, so they must never end up there.
+    Ok((headers, Redirect::temporary(&permanent_url)))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -206,9 +207,10 @@ async fn log_request_middleware(req: Request, next: Next) -> response::Response 
     response
 }
 
-/// Forward a request to the backing store.
+/// Serve an object from the backing store by proxying its content.
 async fn handle_persistent(
     method: Method,
+    request_headers: HeaderMap,
     Path(path): Path<String>,
     State(config): State<Arc<Config>>,
 ) -> Result<impl IntoResponse, RequestError> {
@@ -220,9 +222,42 @@ async fn handle_persistent(
         return Err(RequestError::NoSuchChannel { file_name: path });
     }
 
-    Ok(Redirect::temporary(
-        &config.s3_client.sign_request(method, &path).await?,
-    ))
+    let fetched = config
+        .s3_client
+        .fetch_object(method, &path, Conditions::from_headers(&request_headers))
+        .await?;
+
+    let mut headers = HeaderMap::new();
+    let mut insert = |name, value: Option<String>| {
+        if let Some(value) = value.and_then(|v| HeaderValue::from_str(&v).ok()) {
+            headers.insert(name, value);
+        }
+    };
+
+    Ok(match fetched {
+        Fetched::Found(object) => {
+            insert(CONTENT_TYPE, object.content_type);
+            insert(CONTENT_LENGTH, object.content_length.map(|l| l.to_string()));
+            insert(ETAG, object.etag);
+            insert(LAST_MODIFIED, object.last_modified);
+
+            let body = object
+                .body
+                .map(|stream| Body::new(stream.into_inner()))
+                .unwrap_or_else(Body::empty);
+
+            (headers, body).into_response()
+        }
+        Fetched::NotModified {
+            etag,
+            last_modified,
+        } => {
+            insert(ETAG, etag);
+            insert(LAST_MODIFIED, last_modified);
+
+            (StatusCode::NOT_MODIFIED, headers).into_response()
+        }
+    })
 }
 
 /// Poll the bucket for changes of the configuration.

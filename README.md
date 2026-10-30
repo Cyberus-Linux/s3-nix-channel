@@ -14,7 +14,7 @@ to allow these tarballs to be used as Flake inputs.
 ## ✨ Features
 
 - 📦 Supports multiple channels with different versions
-- 🔄 Lets S3 serve the actual tarballs for efficiency
+- 🔄 ~~Lets S3 serve the actual tarballs for efficiency~~ (Thank you, [npins](https://github.com/andir/npins/pull/223)!)
 - 🔁 Periodically refreshes channel configuration without restarts
 - 🔒 Authentication via [JWT](https://en.wikipedia.org/wiki/JSON_Web_Token) (optional)
 - 🛡️ Strong sandboxing via systemd (when using the Nix module)
@@ -65,6 +65,11 @@ For S3 buckets that need authentication, set these environment variables:
 export AWS_ACCESS_KEY_ID=<your-access-key>
 export AWS_SECRET_ACCESS_KEY=<your-secret-key>
 ```
+
+The credentials need `s3:GetObject` and `s3:ListBucket` permissions on
+the bucket. Without `s3:ListBucket`, S3 reports missing objects as
+"access denied" instead of "not found", and the server answers with
+`502 Bad Gateway` instead of `404 Not Found`.
 
 Start the server:
 

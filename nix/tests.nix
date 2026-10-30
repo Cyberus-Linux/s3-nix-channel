@@ -200,6 +200,26 @@ in
       servePublic.succeed("cmp content/tarball-1234.tar.xz latest.tar.xz")
       servePublic.succeed("cmp content/tarball-1234.tar.xz permanent.tar.xz")
 
+      # Channels redirect to our own permanent URL and never to (expiring)
+      # pre-signed S3 URLs. The permanent URL is served directly.
+      assert "http://localhost/permanent/tarball-1234.tar.xz" == servePublic.succeed("curl -s -o /dev/null -w '%{redirect_url}' http://localhost/channel/thechannel-24.05.tar.xz")
+      assert "200" == servePublic.succeed("curl -s -o /dev/null -w '%{http_code}' http://localhost/permanent/tarball-1234.tar.xz")
+      assert "404" == servePublic.succeed("curl -s -o /dev/null -w '%{http_code}' http://localhost/permanent/does-not-exist.tar.xz")
+
+      # Conditional requests are passed on to S3, so clients with a current
+      # cached copy get a 304 instead of the whole file.
+      permanent = "http://localhost/permanent/tarball-1234.tar.xz"
+      etag = servePublic.succeed(f"curl -s -o /dev/null -w '%header{{etag}}' {permanent}")
+      last_modified = servePublic.succeed(f"curl -s -o /dev/null -w '%header{{last-modified}}' {permanent}")
+      assert etag != "", "No ETag header"
+      assert last_modified != "", "No Last-Modified header"
+
+      assert "304" == servePublic.succeed(f"curl -s -o /dev/null -w '%{{http_code}}' -H 'If-None-Match: {etag}' {permanent}")
+      assert "304" == servePublic.succeed(f"curl -s -o /dev/null -w '%{{http_code}}' --head -H 'If-None-Match: {etag}' {permanent}")
+      assert etag == servePublic.succeed(f"curl -s -o /dev/null -w '%header{{etag}}' -H 'If-None-Match: {etag}' {permanent}")
+      assert "304" == servePublic.succeed(f"curl -s -o /dev/null -w '%{{http_code}}' -H 'If-Modified-Since: {last_modified}' {permanent}")
+      assert "200" == servePublic.succeed(f"curl -s -o /dev/null -w '%{{http_code}}' -H 'If-None-Match: \"stale\"' {permanent}")
+
       # Now with HEAD requests
       assert "200" == servePublic.succeed("curl -s -o /dev/null -w '%{http_code}' --head -vL http://localhost/channel/thechannel-24.05.tar.xz")
       assert "200" == servePublic.succeed("curl -s -o /dev/null -w '%{http_code}' --head -vL http://localhost/permanent/tarball-1234.tar.xz")
