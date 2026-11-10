@@ -1,3 +1,5 @@
+mod db;
+
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{anyhow, Context, Result};
@@ -16,6 +18,7 @@ use axum::{
 };
 use clap::Parser;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
+use sea_orm::Database;
 use tokio::time::interval;
 use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, warn};
@@ -58,6 +61,15 @@ struct Args {
     /// for token verification.
     #[arg(long)]
     jwt_pem: Option<PathBuf>,
+
+    /// Location of the database.
+    ///
+    /// Find more information about the format in the sea-orm manual:
+    /// https://www.sea-ql.org/SeaORM/docs/install-and-config/connection/
+    ///
+    /// For postgres this can look like: postgres://username:password@host/database
+    #[arg(long)]
+    db: String,
 }
 
 struct Config {
@@ -292,6 +304,8 @@ async fn main() -> Result<()> {
             tracing_subscriber::EnvFilter::builder().parse("info,s3-nix-channel=debug")?,
         )
         .init();
+
+    let db = &Database::connect(&args.db).await?;
 
     let s3_client = s3_nix_channel::persistent::Client::new_from_env(&args.bucket).await?;
 
