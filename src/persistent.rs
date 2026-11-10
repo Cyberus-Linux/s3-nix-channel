@@ -588,7 +588,10 @@ mod tests {
         );
 
         // Unparseable dates make the request unconditional.
-        headers.insert(http::header::IF_MODIFIED_SINCE, "yesterday".parse().unwrap());
+        headers.insert(
+            http::header::IF_MODIFIED_SINCE,
+            "yesterday".parse().unwrap(),
+        );
         assert!(Conditions::from_headers(&headers)
             .if_modified_since
             .is_none());
