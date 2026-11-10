@@ -1,5 +1,3 @@
-mod db;
-
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{anyhow, Context, Result};
@@ -18,6 +16,7 @@ use axum::{
 };
 use clap::Parser;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
+use migration::MigratorTrait;
 use sea_orm::Database;
 use tokio::time::interval;
 use tower_http::trace::TraceLayer;
@@ -306,6 +305,8 @@ async fn main() -> Result<()> {
         .init();
 
     let db = &Database::connect(&args.db).await?;
+
+    migration::Migrator::up(db, None).await?;
 
     let s3_client = s3_nix_channel::persistent::Client::new_from_env(&args.bucket).await?;
 

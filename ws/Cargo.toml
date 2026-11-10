@@ -1,8 +1,15 @@
 [workspace]
 resolver = "2"
 members = [
+    "migration",
+    "entity",
     "s3-nix-channel",
 ]
+
+[workspace.dependencies]
+sea-orm = "2.0.4"
+sea-orm-migration = "2.0.4"
+tokio = "1.53.1"
 
 [profile.release]
 lto = "thin"
