@@ -119,6 +119,8 @@
                 ...
               }:
               {
+                packages = [ pkgs.sea-orm-cli ];
+
                 languages.rust.enable = true;
 
                 env = {
