@@ -52,7 +52,8 @@
         # Common arguments can be set here to avoid repeating them later
         # Note: changes here will rebuild all dependency crates
         commonArgs = {
-          src = craneLib.cleanCargoSource ./.;
+          inherit (craneLib.crateNameFromCargoToml { cargoToml = ./ws/s3-nix-channel/Cargo.toml; }) pname version;
+          src = craneLib.cleanCargoSource ./ws;
           strictDeps = true;
 
           buildInputs = [

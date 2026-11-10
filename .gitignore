@@ -1,4 +1,4 @@
-/target
+/ws/target
 result*
 /.direnv
 /.nixos-test-history

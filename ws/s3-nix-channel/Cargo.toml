@@ -29,6 +29,3 @@ tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "t
 tower-http = { version = "0.7.0", features = ["trace"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-
-[profile.release]
-lto = "thin"
