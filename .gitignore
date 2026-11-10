@@ -2,3 +2,4 @@
 result*
 /.direnv
 /.nixos-test-history
+/.devenv

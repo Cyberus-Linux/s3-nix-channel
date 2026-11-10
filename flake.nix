@@ -142,11 +142,18 @@
                   '';
 
                   postgres.enable = true;
+                  postgres.listen_addresses = "localhost"; # The default port is 5432.
                   postgres.initialDatabases = [
                     {
                       name = "app";
+                      user = "app";
+                      pass = "secret";
                     }
                   ];
+
+                  postgres.initialScript = ''
+                    CREATE ROLE postgres SUPERUSER;
+                  '';
                 };
               }
             )
