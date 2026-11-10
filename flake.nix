@@ -26,8 +26,6 @@
 
       nixosModules.default =
         {
-          config,
-          lib,
           pkgs,
           ...
         }:
@@ -114,7 +112,6 @@
             (
               {
                 pkgs,
-                lib,
                 config,
                 ...
               }:
