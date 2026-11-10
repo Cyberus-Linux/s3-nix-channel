@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = [
+    "s3-nix-channel",
+]
+
+[profile.release]
+lto = "thin"
