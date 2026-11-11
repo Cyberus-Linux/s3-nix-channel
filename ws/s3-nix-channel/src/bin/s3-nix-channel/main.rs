@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use anyhow::{anyhow, Context, Result};
 use arc_swap::ArcSwap;
@@ -15,7 +15,6 @@ use axum::{
     Router,
 };
 use clap::Parser;
-use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use migration::MigratorTrait;
 use sea_orm::Database;
 use tokio::time::interval;
@@ -55,11 +54,6 @@ struct Args {
     /// socket from systemd.
     #[arg(long)]
     listen: Option<String>,
-
-    /// Enable authentication using JWT by specifying the public key
-    /// for token verification.
-    #[arg(long)]
-    jwt_pem: Option<PathBuf>,
 
     /// Location of the database.
     ///
@@ -135,66 +129,6 @@ async fn handle_channel(
     // 0.5 and later) record the final URL after redirects. Pre-signed URLs
     // expire, so they must never end up there.
     Ok((headers, Redirect::temporary(&permanent_url)))
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct Claims {
-    // We need nothing.
-}
-
-/// Extract the HTTP Basic Authorization password.
-fn extract_auth_password(headers: &HeaderMap) -> Option<String> {
-    use base64::prelude::*;
-
-    // Get the Authorization header value
-    let header = headers.get("Authorization")?;
-    let header_value = header.to_str().ok()?;
-
-    let credentials = header_value.strip_prefix("Basic ")?.to_owned();
-    let credentials = String::from_utf8(BASE64_STANDARD.decode(&credentials).ok()?).ok()?;
-
-    let pw = credentials
-        .split_once(':')
-        .map(|(_user, password)| password.to_owned());
-
-    pw
-}
-
-/// If a JWT public key is available, make sure that each request is authorized.
-async fn auth_middleware(
-    State(decoding_key): State<DecodingKey>,
-    request: Request,
-    next: Next,
-) -> response::Response {
-    let mut validation = Validation::new(Algorithm::RS256);
-    validation.validate_nbf = true;
-
-    // TODO What we validate in the claims should be configurable. For
-    // now we just check whether the token is signed and valid.
-    validation.validate_aud = false;
-    validation.set_required_spec_claims(&["exp"]);
-
-    match extract_auth_password(request.headers())
-        .ok_or_else(|| RequestError::InvalidToken {
-            reason: "Missing Authorization header".to_owned(),
-        })
-        .and_then(|jwt_str| {
-            jsonwebtoken::decode::<Claims>(&jwt_str, &decoding_key, &validation).map_err(|e| {
-                RequestError::InvalidToken {
-                    reason: e.to_string(),
-                }
-            })
-        }) {
-        Ok(claim) => {
-            debug!("Claim {:?}", claim)
-        }
-        Err(e) => {
-            info!("JWT validation error: {e}");
-            return StatusCode::UNAUTHORIZED.into_response();
-        }
-    }
-
-    next.run(request).await
 }
 
 async fn log_request_middleware(req: Request, next: Next) -> response::Response {
@@ -311,20 +245,6 @@ async fn main() -> Result<()> {
     let s3_client = s3_nix_channel::persistent::Client::new_from_env(&args.bucket).await?;
 
     let channels = s3_client.load_channels_config().await?;
-    let jwt_public_key = args
-        .jwt_pem
-        .map(|pem_file| {
-            std::fs::read(&pem_file).with_context(|| {
-                format!("Failed to read public key PEM from {}", pem_file.display())
-            })
-        })
-        // Be sure to handle the I/O error, so we don't accidentally
-        // misinterpret "couldn't read file" as "there is no public
-        // key", which would make the service accessible without
-        // authentication.
-        .transpose()?
-        .map(|pem_data| DecodingKey::from_rsa_pem(&pem_data).context("Failed to decode public key"))
-        .transpose()?;
 
     let config = Arc::new(Config {
         s3_client,
@@ -339,21 +259,11 @@ async fn main() -> Result<()> {
         poll_config_file(&update_state).await;
     });
 
-    // TODO Add proper logging of requests.
-    let mut app = Router::new()
+    let app = Router::new()
         .route("/channel/{*path}", get(handle_channel))
         .route("/permanent/{*path}", get(handle_persistent))
-        .with_state(config);
-
-    if let Some(jwt_public_key) = jwt_public_key {
-        let auth_layer = middleware::from_fn_with_state(jwt_public_key, auth_middleware);
-
-        app = app.layer(auth_layer);
-    }
-
-    // Layer logging last, so we can see authentication failures as well.
-    app = app
-	.layer(middleware::from_fn(log_request_middleware))
+        .with_state(config)
+        .layer(middleware::from_fn(log_request_middleware))
         .layer(
             TraceLayer::new_for_http().make_span_with(|request: &Request| {
                 tracing::debug_span!("request", method = %request.method(), uri = %request.uri())
