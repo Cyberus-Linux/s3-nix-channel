@@ -7,7 +7,6 @@ pub struct Migration;
 enum Channel {
     Table,
     Id,
-    Name,
     LatestUpdateId,
 }
 
@@ -42,7 +41,6 @@ impl MigrationTrait for Migration {
                 Table::create()
                     .table(Channel::Table)
                     .col(big_pk_auto(Channel::Id))
-                    .col(string_uniq(Channel::Name))
                     // When channels are created, they don't have an update.
                     .col(big_integer_null(Channel::LatestUpdateId))
                     .to_owned(),
@@ -55,7 +53,7 @@ impl MigrationTrait for Migration {
                     .table(Alias::Table)
                     .col(big_pk_auto(Alias::Id))
                     .col(big_integer(Alias::ChannelId))
-                    .col(string(Alias::Name))
+                    .col(string_uniq(Alias::Name))
                     .foreign_key(
                         ForeignKey::create()
                             .name(FK_ALIAS_CHANNEL)

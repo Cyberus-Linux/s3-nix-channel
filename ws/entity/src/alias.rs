@@ -9,6 +9,7 @@ pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i64,
     pub channel_id: i64,
+    #[sea_orm(unique)]
     pub name: String,
     #[sea_orm(
         belongs_to,

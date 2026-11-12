@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{ensure, Context, Result};
 use clap::{Parser, Subcommand};
 use migration::MigratorTrait;
 use s3_nix_channel::persistent::Client;
@@ -79,7 +79,11 @@ struct Args {
 impl Args {
     fn bucket(&self) -> &str {
         match &self.commands {
-            Commands::ImportLegacy { db: _, apply_migrations: _, bucket } => bucket,
+            Commands::ImportLegacy {
+                db: _,
+                apply_migrations: _,
+                bucket,
+            } => bucket,
             Commands::ListChannels { bucket }
             | Commands::AddChannel {
                 bucket,
@@ -103,7 +107,7 @@ impl Args {
 
 async fn import_legacy(s3_client: &Client, db: &str, apply_migrations: bool) -> Result<()> {
     use entity::{alias, channel, update};
-    use sea_orm::{prelude::*};
+    use sea_orm::prelude::*;
 
     let config = s3_client.load_channels_config().await?;
 
@@ -112,26 +116,30 @@ async fn import_legacy(s3_client: &Client, db: &str, apply_migrations: bool) -> 
     if apply_migrations {
         migration::Migrator::up(db, None).await?;
     } else {
-        ensure!(migration::Migrator::get_pending_migrations_read_only(db).await?.is_empty(),
-                "Database has pending migrations. Aborting.");
+        ensure!(
+            migration::Migrator::get_pending_migrations_read_only(db)
+                .await?
+                .is_empty(),
+            "Database has pending migrations. Aborting."
+        );
     }
 
     for (channel_name, cfg) in config.channels() {
         let ext = &cfg.file_extension;
         let name = format!("{channel_name}{ext}");
 
-        if channel::Entity::find_by_name(&name).one(db).await?.is_some() {
+        if alias::Entity::find_by_name(&name).one(db).await?.is_some() {
             warn!("Channel {name} already exists. Won't migrate legacy data.");
             continue;
         }
 
         db.transaction_async(async move |tx| -> Result<()> {
             // Inserts the channel together with its aliases.
-            let channel = cfg
-                .aliases
-                .iter()
-                .fold(channel::ActiveModel::builder().set_name(name), |channel, alias| {
-                    channel.add_alias(alias::ActiveModel::builder().set_name(format!("{alias}{ext}")))
+            let channel = std::iter::once(&format!("{name}{ext}"))
+                .chain(cfg.aliases.iter())
+                .fold(channel::ActiveModel::builder(), |channel, alias| {
+                    channel
+                        .add_alias(alias::ActiveModel::builder().set_name(format!("{alias}{ext}")))
                 })
                 .insert(tx)
                 .await?;
@@ -161,7 +169,8 @@ async fn import_legacy(s3_client: &Client, db: &str, apply_migrations: bool) -> 
             }
 
             Ok(())
-        }).await?;
+        })
+        .await?;
     }
 
     Ok(())
@@ -231,7 +240,11 @@ async fn main() -> Result<()> {
         .init();
 
     match args.commands {
-        Commands::ImportLegacy { db, bucket: _, apply_migrations } => import_legacy(&s3_client, &db, apply_migrations).await?,
+        Commands::ImportLegacy {
+            db,
+            bucket: _,
+            apply_migrations,
+        } => import_legacy(&s3_client, &db, apply_migrations).await?,
         Commands::ListChannels { bucket: _ } => list_channels(&s3_client).await?,
         Commands::ShowChannel { bucket: _, channel } => show_channel(&s3_client, &channel).await?,
         Commands::AddChannel {
