@@ -139,6 +139,9 @@
 
                     # 3. Grant the hardcoded key permissions to the bucket
                     garage bucket allow --read --write --owner dev-bucket --key app-key
+
+                    # Populate the bucket with test data.
+                    ${pkgs.awscli2}/bin/aws s3 sync "$DEVENV_ROOT/test-data" s3://dev-bucket/
                   '';
 
                   postgres.enable = true;

@@ -1,0 +1,11 @@
+{
+  "latest": "os-c220c710b2c8fdf93e9de631d23a04bf2b391e5",
+  "file_extension": ".tar.xz",
+  "aliases": [
+    "linux-26.05"
+  ],
+  "previous": [
+    "os-5a9b78ad98a464113c8686555fd2f6c2a5004200",
+    "os-936860f69b3f2c3aeae777cb4660b2128587d172"
+  ]
+}
