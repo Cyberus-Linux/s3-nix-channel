@@ -135,11 +135,10 @@ async fn import_legacy(s3_client: &Client, db: &str, apply_migrations: bool) -> 
 
         db.transaction_async(async move |tx| -> Result<()> {
             // Inserts the channel together with its aliases.
-            let channel = std::iter::once(&format!("{name}{ext}"))
-                .chain(cfg.aliases.iter())
+            let channel = std::iter::once(name)
+                .chain(cfg.aliases.iter().map(|a| format!("{a}{ext}")))
                 .fold(channel::ActiveModel::builder(), |channel, alias| {
-                    channel
-                        .add_alias(alias::ActiveModel::builder().set_name(format!("{alias}{ext}")))
+                    channel.add_alias(alias::ActiveModel::builder().set_name(alias))
                 })
                 .insert(tx)
                 .await?;

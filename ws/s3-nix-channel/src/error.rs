@@ -11,9 +11,9 @@ pub enum RequestError {
     NoSuchObject { object_key: String },
     #[error("There is no such channel: {file_name:?}")]
     NoSuchChannel { file_name: String },
+    #[error("Database error: {reason}")]
+    DatabaseFailure { reason: String },
 
-    #[error("Invalid token: {reason}")]
-    InvalidToken { reason: String },
     #[error("Unsupported HTTP method: {method}")]
     UnsupportedMethod { method: http::Method },
     #[error("Unknown error")]
@@ -26,7 +26,7 @@ impl IntoResponse for RequestError {
             match self {
                 RequestError::NoSuchChannel { file_name: _ }
                 | RequestError::NoSuchObject { object_key: _ } => StatusCode::NOT_FOUND,
-                RequestError::InvalidToken { reason: _ } => StatusCode::FORBIDDEN,
+                RequestError::DatabaseFailure { reason: _ } => StatusCode::INTERNAL_SERVER_ERROR,
                 RequestError::UnsupportedMethod { method: _ } => StatusCode::METHOD_NOT_ALLOWED,
                 RequestError::BackendFailure { object_key: _ } => StatusCode::BAD_GATEWAY,
                 RequestError::Unknown => StatusCode::INTERNAL_SERVER_ERROR,

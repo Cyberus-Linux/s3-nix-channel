@@ -1,7 +1,6 @@
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
-use arc_swap::ArcSwap;
 use axum::{
     body::Body,
     extract::{Path, Request, State},
@@ -15,15 +14,18 @@ use axum::{
     Router,
 };
 use clap::Parser;
+use entity::{alias, channel, update};
 use migration::MigratorTrait;
-use sea_orm::Database;
-use tokio::time::interval;
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, Database, DatabaseConnection, EntityTrait, JoinType, QueryFilter,
+    QuerySelect, RelationTrait, Select,
+};
 use tower_http::trace::TraceLayer;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use s3_nix_channel::{
     error::RequestError,
-    persistent::{ChannelsConfig, Conditions, Fetched},
+    persistent::{Conditions, Fetched},
 };
 
 /// A program to serve a S3 bucket via the Nix Lockable Tarball Protocol.
@@ -41,11 +43,6 @@ struct Args {
     /// https://foo.com here.
     #[arg(long)]
     base_url: String,
-
-    /// The interval in seconds for updating the configuration from
-    /// the config.json file in the bucket.
-    #[arg(long, default_value_t = 3600)]
-    config_update_seconds: u64,
 
     /// What IP and port to listen on. Specify as <IP>:<port>, for
     /// example: 0.0.0.0:3000
@@ -67,9 +64,34 @@ struct Args {
 
 struct Config {
     s3_client: s3_nix_channel::persistent::Client,
+    db: DatabaseConnection,
+
     base_url: String,
-    update_interval: Duration,
-    channels: ArcSwap<ChannelsConfig>,
+}
+
+/// Find the update that `channel.latest_update_id` points to, looking up the
+/// channel by any of its names.
+fn latest_channel_update_query(name: &str) -> Select<update::Entity> {
+    update::Entity::find()
+        // JOIN channel ON channel.latest_update_id = update.id
+        .join_rev(JoinType::InnerJoin, channel::Relation::Update.def())
+        // JOIN alias ON alias.channel_id = channel.id
+        .join(JoinType::InnerJoin, channel::Relation::Alias.def())
+        .filter(alias::Column::Name.eq(name))
+}
+
+async fn latest_channel_update<C>(db: &C, name: &str) -> Result<Option<String>, RequestError>
+where
+    C: ConnectionTrait,
+{
+    let latest = latest_channel_update_query(name)
+        .one(db)
+        .await
+        .map_err(|e| RequestError::DatabaseFailure {
+            reason: e.to_string(),
+        })?;
+
+    Ok(latest.map(|u| u.persistent_file))
 }
 
 /// Redirect to the latest tarball of the requested channel.
@@ -77,58 +99,27 @@ async fn handle_channel(
     Path(path): Path<String>,
     State(config): State<Arc<Config>>,
 ) -> Result<impl IntoResponse, RequestError> {
-    let channel_config = {
-        let channels_config = config.channels.load();
+    if let Some(latest_object) = latest_channel_update(&config.db, &path).await? {
+        let permanent_url = format!("{}/permanent/{latest_object}", config.base_url);
 
-        // TODO Needlessly inefficient. But we cannot use split_filename here,
-        // because channel names often include periods, such as foobar-24.05.
-        // :-(
-        let (_, channel_config) = channels_config
-            .channels()
-            .find(|(k, v)| {
-                std::iter::once(*k)
-                    .chain(v.aliases.iter().map(|s| s.as_str()))
-                    .find(|name| {
-                        let candidate = format!("{name}{}", v.file_extension);
-                        path == candidate
-                    })
-                    .is_some()
-            })
-            .ok_or_else(|| RequestError::NoSuchChannel {
-                file_name: path.clone(),
-            })?;
-        channel_config.clone()
-    };
+        let mut headers = HeaderMap::new();
 
-    let latest_object = &channel_config
-        .latest
-        // We could have a specific error here, but this only happens
-        // when a channel is initially set up. It becomes visible once
-        // it has content.
-        .ok_or_else(|| RequestError::NoSuchChannel {
-            file_name: path.clone(),
-        })?;
+        // The Lockable HTTP Tarball Protocol. See:
+        // https://nix.dev/manual/nix/2.25/protocols/tarball-fetcher
+        headers.insert(
+            LINK,
+            HeaderValue::from_str(&format!("<{permanent_url}>; rel=\"immutable\""))
+                .map_err(|_e| RequestError::Unknown)?,
+        );
 
-    let permanent_url = format!(
-        "{}/permanent/{latest_object}{}",
-        config.base_url, channel_config.file_extension
-    );
-
-    let mut headers = HeaderMap::new();
-
-    // The Lockable HTTP Tarball Protocol. See:
-    // https://nix.dev/manual/nix/2.25/protocols/tarball-fetcher
-    headers.insert(
-        LINK,
-        HeaderValue::from_str(&format!("<{permanent_url}>; rel=\"immutable\""))
-            .map_err(|_e| RequestError::Unknown)?,
-    );
-
-    // We redirect to our own permanent URL instead of a pre-signed S3 URL.
-    // Tools that don't speak the Lockable HTTP Tarball Protocol (e.g. npins
-    // 0.5 and later) record the final URL after redirects. Pre-signed URLs
-    // expire, so they must never end up there.
-    Ok((headers, Redirect::temporary(&permanent_url)))
+        // We redirect to our own permanent URL instead of a pre-signed S3 URL.
+        // Tools that don't speak the Lockable HTTP Tarball Protocol (e.g. npins
+        // 0.5 and later) record the final URL after redirects. Pre-signed URLs
+        // expire, so they must never end up there.
+        Ok((headers, Redirect::temporary(&permanent_url)))
+    } else {
+        Err(RequestError::NoSuchChannel { file_name: path })
+    }
 }
 
 async fn log_request_middleware(req: Request, next: Next) -> response::Response {
@@ -205,29 +196,6 @@ async fn handle_persistent(
     })
 }
 
-/// Poll the bucket for changes of the configuration.
-async fn poll_config_file(state: &Config) {
-    let mut interval = interval(state.update_interval);
-
-    // The first tick completes immediately, so we skip it.
-    interval.tick().await;
-
-    loop {
-        interval.tick().await;
-
-        let new_channels = match state.s3_client.load_channels_config().await {
-            Ok(channels) => channels,
-            Err(e) => {
-                error!("Failed to load new config (will try again later): {e}");
-                continue;
-            }
-        };
-
-        state.channels.store(Arc::new(new_channels));
-        info!("Successfully refreshed channel state.")
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -238,25 +206,16 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let db = &Database::connect(&args.db).await?;
+    let db = Database::connect(&args.db).await?;
 
-    migration::Migrator::up(db, None).await?;
+    migration::Migrator::up(&db, None).await?;
 
     let s3_client = s3_nix_channel::persistent::Client::new_from_env(&args.bucket).await?;
 
-    let channels = s3_client.load_channels_config().await?;
-
     let config = Arc::new(Config {
         s3_client,
+        db,
         base_url: args.base_url,
-        update_interval: Duration::from_secs(args.config_update_seconds),
-        channels: ArcSwap::new(Arc::new(channels)),
-    });
-
-    // Reload the config periodically.
-    let update_state = config.clone();
-    tokio::spawn(async move {
-        poll_config_file(&update_state).await;
     });
 
     let app = Router::new()
