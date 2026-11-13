@@ -1,5 +1,4 @@
-//! This module tries to abstract the persistent storage backend. The
-//! abstraction is not perfect as S3 leaks through pretty heavily. :)
+//! Access to the S3 bucket that stores the published files.
 
 use std::path::Path;
 

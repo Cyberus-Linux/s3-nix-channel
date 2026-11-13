@@ -5,8 +5,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result};
-use s3_nix_channel::persistent::Client;
 use serde::Deserialize;
+use storage::s3::Client;
 use tracing::{debug, error, info, warn};
 
 /// The configuration that lives in the S3 bucket as /channels.json.

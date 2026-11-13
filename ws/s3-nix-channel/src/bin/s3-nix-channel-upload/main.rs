@@ -6,10 +6,10 @@ use anyhow::{ensure, Context, Result};
 use clap::{Parser, Subcommand};
 use entity::{alias, channel, update};
 use migration::MigratorTrait;
-use s3_nix_channel::persistent::Client;
 use sea_orm::{
     prelude::*, ActiveValue::Set, Database, DatabaseConnection, IntoActiveModel, QueryOrder,
 };
+use storage::s3::Client;
 use tracing::{info, warn};
 
 #[derive(Subcommand, Debug)]

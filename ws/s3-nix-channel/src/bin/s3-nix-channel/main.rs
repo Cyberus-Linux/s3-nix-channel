@@ -23,9 +23,9 @@ use sea_orm::{
 use tower_http::trace::TraceLayer;
 use tracing::{debug, info, warn};
 
-use s3_nix_channel::{
+use storage::{
     error::RequestError,
-    persistent::{Conditions, Fetched},
+    s3::{Conditions, Fetched},
 };
 
 /// A program to serve a S3 bucket via the Nix Lockable Tarball Protocol.
@@ -63,7 +63,7 @@ struct Args {
 }
 
 struct Config {
-    s3_client: s3_nix_channel::persistent::Client,
+    s3_client: storage::s3::Client,
     db: DatabaseConnection,
 
     base_url: String,
@@ -210,7 +210,7 @@ async fn main() -> Result<()> {
 
     migration::Migrator::up(&db, None).await?;
 
-    let s3_client = s3_nix_channel::persistent::Client::new_from_env(&args.bucket).await?;
+    let s3_client = storage::s3::Client::new_from_env(&args.bucket).await?;
 
     let config = Arc::new(Config {
         s3_client,

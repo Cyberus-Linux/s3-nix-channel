@@ -1,0 +1,16 @@
+[package]
+authors = ["Cyberus Technology GmbH"]
+name = "storage"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+aws-config = { version = "1.11.0", features = ["behavior-version-latest", "default-https-client", "rt-tokio"], default-features = false }
+aws-sdk-s3 = { version = "1.143.0", default-features = false, features = ["default-https-client", "rt-tokio", "sigv4a"] }
+axum = { workspace = true }
+thiserror = "2.0.20"
+tokio = { workspace = true, features = ["fs"] }
+tracing = { workspace = true }
