@@ -16,6 +16,7 @@ anyhow = { workspace = true }
 arc-swap = "1.9.2"
 axum = { workspace = true, features = ["http1", "http2", "macros", "tokio", "tracing"] }
 clap = { version = "4.6.6", default-features = false, features = ["derive", "help", "std", "usage"] }
+indicatif = "0.18.6"
 sd-notify = { version = "0.5.0", default-features = false }
 sea-orm = { workspace = true, features = ["runtime-tokio", "sqlx-postgres"] }
 serde = { version = "1.0.229", features = ["derive"] }

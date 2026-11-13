@@ -24,6 +24,7 @@ enum Update {
     Id,
     ChannelId,
     PersistentFile,
+    Sha256,
     Timestamp,
 }
 
@@ -71,6 +72,12 @@ impl MigrationTrait for Migration {
                     .col(big_pk_auto(Update::Id))
                     .col(big_integer(Update::ChannelId))
                     .col(string(Update::PersistentFile))
+                    // SHA-256 of the file as raw bytes. Postgres ignores the
+                    // length of binary columns, so we check it explicitly.
+                    .col(
+                        binary_len(Update::Sha256, 32)
+                            .check(Expr::cust("octet_length(sha256) = 32")),
+                    )
                     .col(timestamp_with_time_zone(Update::Timestamp))
                     .foreign_key(
                         ForeignKey::create()

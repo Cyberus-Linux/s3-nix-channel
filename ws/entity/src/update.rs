@@ -10,6 +10,8 @@ pub struct Model {
     pub id: i64,
     pub channel_id: i64,
     pub persistent_file: String,
+    #[sea_orm(column_type = "VarBinary(StringLen::None)")]
+    pub sha256: Vec<u8>,
     pub timestamp: DateTimeWithTimeZone,
     #[sea_orm(
         belongs_to,

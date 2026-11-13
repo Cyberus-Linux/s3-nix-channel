@@ -74,6 +74,12 @@ impl ChannelConfig {
 
         original_size != self.previous.len()
     }
+
+    /// Whether the channel has previous releases, but no latest one. Such a
+    /// configuration is broken.
+    pub fn is_missing_latest(&self) -> bool {
+        self.latest.is_none() && !self.previous.is_empty()
+    }
 }
 
 fn default_channel_file_extension() -> String {
@@ -82,8 +88,9 @@ fn default_channel_file_extension() -> String {
 
 /// Load the configuration of all channels from the bucket.
 ///
-/// Fails if the bucket has no channels.json. Channels whose configuration
-/// can't be read are skipped with an error message.
+/// Fails if the bucket has no channels.json or if a channel has previous
+/// releases, but no latest one. Channels whose configuration can't be read
+/// are skipped with an error message.
 pub async fn load_channels_config(client: &Client) -> Result<BTreeMap<String, ChannelConfig>> {
     let mut channels = BTreeMap::new();
 
@@ -127,6 +134,17 @@ pub async fn load_channels_config(client: &Client) -> Result<BTreeMap<String, Ch
             }
         }
     }
+
+    let broken: Vec<&str> = channels
+        .iter()
+        .filter(|(_, cfg)| cfg.is_missing_latest())
+        .map(|(name, _)| name.as_str())
+        .collect();
+    ensure!(
+        broken.is_empty(),
+        "These channels have previous releases, but no latest one: {}\nFix their configuration in the bucket before importing.",
+        broken.join(", ")
+    );
 
     Ok(channels)
 }
@@ -208,5 +226,13 @@ mod tests {
         let mut cfg = channel(None, &["a", "a"]);
         assert!(cfg.remove_previous_duplicates());
         assert_eq!(cfg.previous, ["a"]);
+    }
+
+    #[test]
+    fn is_missing_latest_works() {
+        assert!(!channel(None, &[]).is_missing_latest());
+        assert!(!channel(Some("b"), &[]).is_missing_latest());
+        assert!(!channel(Some("b"), &["a"]).is_missing_latest());
+        assert!(channel(None, &["a"]).is_missing_latest());
     }
 }

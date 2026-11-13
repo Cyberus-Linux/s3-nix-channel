@@ -8,11 +8,12 @@ use std::{
 use anyhow::{ensure, Context, Result};
 use clap::{Parser, Subcommand};
 use entity::{alias, channel, update};
+use indicatif::{ProgressBar, ProgressStyle};
 use migration::MigratorTrait;
 use sea_orm::{
     prelude::*, ActiveValue::Set, Database, DatabaseConnection, IntoActiveModel, QueryOrder,
 };
-use storage::s3::Client;
+use storage::{hash::Sha256, s3::Client};
 use tracing::{info, warn};
 
 #[derive(Subcommand, Debug)]
@@ -159,61 +160,126 @@ fn require_matching_extension(channel_name: &str, name: &str, force: bool) -> Re
     Ok(())
 }
 
+/// A progress bar that counts files.
+fn file_progress_bar(files: usize) -> ProgressBar {
+    let style = ProgressStyle::with_template("[{bar:30}] {pos}/{len} files {msg}")
+        .expect("valid progress bar template")
+        .progress_chars("=> ");
+
+    ProgressBar::new(files as u64).with_style(style)
+}
+
+/// A legacy channel with all its file hashes, ready to be written to the
+/// database.
+struct ChannelImport {
+    /// All names of the channel, including the file extension.
+    names: Vec<String>,
+    /// The files of the channel and their hashes, oldest first. The last one
+    /// is the latest release.
+    updates: Vec<(String, Sha256)>,
+}
+
 async fn import_legacy(
+    s3_client: &Client,
     config: BTreeMap<String, legacy::ChannelConfig>,
     db: &DatabaseConnection,
 ) -> Result<()> {
+    // Decide what to import first, so the progress bar knows how many files
+    // there are.
+    let mut channels = Vec::new();
     for (channel_name, mut cfg) in config {
         if cfg.remove_previous_duplicates() {
             info!("Skipping duplicate entries in the history of {channel_name}.");
         }
 
-        let ext = &cfg.file_extension;
-        let name = format!("{channel_name}{ext}");
+        let name = format!("{channel_name}{}", cfg.file_extension);
 
         if alias::Entity::find_by_name(&name).one(db).await?.is_some() {
             warn!("Channel {name} already exists. Won't migrate legacy data.");
             continue;
         }
 
-        db.transaction_async(async move |tx| -> Result<()> {
-            // Inserts the channel together with its aliases.
-            let channel = std::iter::once(name)
+        channels.push((name, cfg));
+    }
+
+    // Hash all files before touching the database. Downloading them can take
+    // a while and fail, and we don't want to leave a partial import behind.
+    let files = channels
+        .iter()
+        .map(|(_, cfg)| cfg.previous.len() + usize::from(cfg.latest.is_some()))
+        .sum();
+    let bar = file_progress_bar(files);
+
+    let mut imports = Vec::with_capacity(channels.len());
+    for (name, cfg) in channels {
+        let ext = &cfg.file_extension;
+
+        // `previous` is ordered oldest first, so the latest file comes last.
+        let mut updates = Vec::new();
+        for file in cfg.previous.iter().chain(&cfg.latest) {
+            let object_key = format!("{file}{ext}");
+
+            bar.set_message(object_key.clone());
+            let sha256 = s3_client
+                .hash_object(&object_key)
+                .await
+                .with_context(|| format!("Failed to hash {object_key} of channel {name}"))?;
+            bar.inc(1);
+
+            updates.push((object_key, sha256));
+        }
+
+        imports.push(ChannelImport {
+            names: std::iter::once(name)
                 .chain(cfg.aliases.iter().map(|a| format!("{a}{ext}")))
-                .fold(channel::ActiveModel::builder(), |channel, alias| {
-                    channel.add_alias(alias::ActiveModel::builder().set_name(alias))
+                .collect(),
+            updates,
+        });
+    }
+
+    bar.finish_with_message("");
+
+    // Write everything in one transaction, so a failed import leaves the
+    // database untouched and can simply be restarted.
+    db.transaction_async(async move |tx| -> Result<()> {
+        for import in imports {
+            // Inserts the channel together with its aliases.
+            let channel = import
+                .names
+                .into_iter()
+                .fold(channel::ActiveModel::builder(), |channel, name| {
+                    channel.add_alias(alias::ActiveModel::builder().set_name(name))
                 })
                 .insert(tx)
                 .await?;
 
-            let add_update = |file: &str| {
-                update::ActiveModel::builder()
+            let mut last_update_id = None;
+            for (object_key, sha256) in import.updates {
+                let update = update::ActiveModel::builder()
                     .set_channel(channel.clone())
-                    .set_persistent_file(format!("{file}{ext}"))
+                    .set_persistent_file(object_key)
+                    .set_sha256(Vec::from(sha256))
                     .set_timestamp(ChronoUtc::now())
                     .insert(tx)
-            };
+                    .await?;
 
-            for file in &cfg.previous {
-                add_update(file).await?;
+                last_update_id = Some(update.id);
             }
 
             // The channel and its updates reference each other, so the latest
             // update can only be linked after both exist.
-            if let Some(latest) = &cfg.latest {
-                let latest = add_update(latest).await?;
-
+            if last_update_id.is_some() {
                 channel
                     .into_active_model()
-                    .set_latest_update_id(Some(latest.id))
+                    .set_latest_update_id(last_update_id)
                     .update(tx)
                     .await?;
             }
+        }
 
-            Ok(())
-        })
-        .await?;
-    }
+        Ok(())
+    })
+    .await?;
 
     Ok(())
 }
@@ -295,7 +361,10 @@ async fn publish(
 
     require_matching_extension(channel_name, &file_name, force)?;
 
-    let object_key = s3_client.upload_new_file(file).await?;
+    let uploaded = s3_client.upload_new_file(file).await?;
+
+    let object_key = uploaded.object_key;
+    let sha256 = uploaded.sha256;
 
     // Record the update and make it the latest in one go.
     let persistent_file = object_key.clone();
@@ -303,6 +372,7 @@ async fn publish(
         let update = update::ActiveModel::builder()
             .set_channel_id(channel.id)
             .set_persistent_file(persistent_file)
+            .set_sha256(Vec::from(sha256))
             .set_timestamp(ChronoUtc::now())
             .insert(tx)
             .await?;
@@ -318,7 +388,7 @@ async fn publish(
         format!("Failed to update channel. This leaked {object_key}! Remove it manually, if this is an issue.")
     })?;
 
-    println!("Channel {channel_name} now points to {object_key}.");
+    println!("Channel {channel_name} now points to {object_key} (SHA-256 {sha256}).");
 
     Ok(())
 }
@@ -345,7 +415,12 @@ async fn main() -> Result<()> {
             let s3_client = Client::new_from_env(&bucket).await;
             let config = legacy::load_channels_config(&s3_client).await?;
 
-            import_legacy(config, &connect(&args.db, apply_migrations).await?).await?
+            import_legacy(
+                &s3_client,
+                config,
+                &connect(&args.db, apply_migrations).await?,
+            )
+            .await?
         }
         Commands::ListChannels => list_channels(&db().await?).await?,
         Commands::ShowChannel { channel } => show_channel(&db().await?, &channel).await?,

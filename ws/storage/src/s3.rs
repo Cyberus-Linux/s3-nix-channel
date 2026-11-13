@@ -9,7 +9,16 @@ use aws_sdk_s3::{
 };
 use tracing::error;
 
-use crate::error::{BoxError, FetchError, StorageError};
+use crate::{
+    error::{BoxError, FetchError, StorageError},
+    hash::{Hasher, Sha256},
+};
+
+/// A file that was uploaded to the bucket.
+pub struct UploadedFile {
+    pub object_key: String,
+    pub sha256: Sha256,
+}
 
 /// An object fetched from the bucket, ready to be passed on to a client.
 pub struct Object {
@@ -217,17 +226,39 @@ impl Client {
         }
     }
 
-    /// Upload a file to the persistent store. Doesn't update any channel.
-    async fn write_file(&self, object_key: &str, file: &Path) -> Result<(), StorageError> {
-        // We would want to stream the file and not load it all in
-        // memory, but it results in XAmzContentSHA256Mismatch. :(
-        let data = tokio::fs::read(file)
-            .await
-            .map_err(|source| StorageError::LocalFile {
-                path: file.to_owned(),
-                source,
-            })?;
+    /// Download an object and compute its SHA-256 hash.
+    ///
+    /// The object is streamed, so this also works for large files.
+    pub async fn hash_object(&self, object_key: &str) -> Result<Sha256, StorageError> {
+        let read_error = |source: BoxError| StorageError::Read {
+            object_key: object_key.to_owned(),
+            source,
+        };
 
+        let mut response = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(object_key)
+            .send()
+            .await
+            .map_err(|e| read_error(e.into()))?;
+
+        let mut hasher = Hasher::default();
+        while let Some(chunk) = response
+            .body
+            .try_next()
+            .await
+            .map_err(|e| read_error(e.into()))?
+        {
+            hasher.update(&chunk);
+        }
+
+        Ok(hasher.finalize())
+    }
+
+    /// Upload data to the persistent store. Doesn't update any channel.
+    async fn write_data(&self, object_key: &str, data: Vec<u8>) -> Result<(), StorageError> {
         self.client
             .put_object()
             .bucket(&self.bucket)
@@ -264,8 +295,9 @@ impl Client {
 
     /// Upload a file to the bucket, using its file name as object key.
     ///
-    /// Refuses to overwrite existing objects. Returns the object key.
-    pub async fn upload_new_file(&self, file: &Path) -> Result<String, StorageError> {
+    /// Refuses to overwrite existing objects. The file is hashed before it is
+    /// uploaded.
+    pub async fn upload_new_file(&self, file: &Path) -> Result<UploadedFile, StorageError> {
         let object_key = file
             .file_name()
             .and_then(|name| name.to_str())
@@ -278,9 +310,22 @@ impl Client {
             return Err(StorageError::AlreadyExists { object_key });
         }
 
-        self.write_file(&object_key, file).await?;
+        // We would want to stream the file and not load it all in
+        // memory, but it results in XAmzContentSHA256Mismatch. :(
+        let data = tokio::fs::read(file)
+            .await
+            .map_err(|source| StorageError::LocalFile {
+                path: file.to_owned(),
+                source,
+            })?;
 
-        Ok(object_key)
+        let mut hasher = Hasher::default();
+        hasher.update(&data);
+        let sha256 = hasher.finalize();
+
+        self.write_data(&object_key, data).await?;
+
+        Ok(UploadedFile { object_key, sha256 })
     }
 }
 
