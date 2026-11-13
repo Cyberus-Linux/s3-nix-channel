@@ -1,3 +1,5 @@
+mod error;
+
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
@@ -5,7 +7,10 @@ use axum::{
     body::Body,
     extract::{Path, Request, State},
     http::{
-        header::{CONTENT_LENGTH, CONTENT_TYPE, ETAG, LAST_MODIFIED, LINK},
+        header::{
+            CONTENT_LENGTH, CONTENT_TYPE, ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED,
+            LINK,
+        },
         HeaderMap, HeaderValue, Method, StatusCode,
     },
     middleware::{self, Next},
@@ -23,10 +28,9 @@ use sea_orm::{
 use tower_http::trace::TraceLayer;
 use tracing::{debug, info, warn};
 
-use storage::{
-    error::RequestError,
-    s3::{Conditions, Fetched},
-};
+use storage::s3::{Conditions, FetchMethod, Fetched};
+
+use crate::error::RequestError;
 
 /// A program to serve a S3 bucket via the Nix Lockable Tarball Protocol.
 #[derive(Parser, Debug)]
@@ -143,6 +147,21 @@ async fn log_request_middleware(req: Request, next: Next) -> response::Response 
     response
 }
 
+/// Extract the conditional request headers that we pass on to S3.
+fn conditions_from_headers(headers: &HeaderMap) -> Conditions {
+    let get = |name| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    };
+
+    Conditions {
+        if_none_match: get(IF_NONE_MATCH),
+        if_modified_since: get(IF_MODIFIED_SINCE),
+    }
+}
+
 /// Serve an object from the backing store by proxying its content.
 async fn handle_persistent(
     method: Method,
@@ -158,9 +177,15 @@ async fn handle_persistent(
         return Err(RequestError::NoSuchChannel { file_name: path });
     }
 
+    let method = match method {
+        Method::GET => FetchMethod::Get,
+        Method::HEAD => FetchMethod::Head,
+        method => return Err(RequestError::UnsupportedMethod { method }),
+    };
+
     let fetched = config
         .s3_client
-        .fetch_object(method, &path, Conditions::from_headers(&request_headers))
+        .fetch_object(method, &path, conditions_from_headers(&request_headers))
         .await?;
 
     let mut headers = HeaderMap::new();
@@ -210,7 +235,7 @@ async fn main() -> Result<()> {
 
     migration::Migrator::up(&db, None).await?;
 
-    let s3_client = storage::s3::Client::new_from_env(&args.bucket).await?;
+    let s3_client = storage::s3::Client::new_from_env(&args.bucket).await;
 
     let config = Arc::new(Config {
         s3_client,
@@ -263,4 +288,29 @@ async fn main() -> Result<()> {
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conditions_from_headers_works() {
+        let mut headers = HeaderMap::new();
+        let conditions = conditions_from_headers(&headers);
+        assert!(conditions.if_none_match.is_none());
+        assert!(conditions.if_modified_since.is_none());
+
+        headers.insert(IF_NONE_MATCH, "\"abc\"".parse().unwrap());
+        headers.insert(
+            IF_MODIFIED_SINCE,
+            "Wed, 21 Oct 2015 07:28:00 GMT".parse().unwrap(),
+        );
+        let conditions = conditions_from_headers(&headers);
+        assert_eq!(conditions.if_none_match.as_deref(), Some("\"abc\""));
+        assert_eq!(
+            conditions.if_modified_since.as_deref(),
+            Some("Wed, 21 Oct 2015 07:28:00 GMT")
+        );
+    }
 }

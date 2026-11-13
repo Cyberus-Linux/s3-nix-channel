@@ -12,6 +12,7 @@ anyhow = "1.0.104"
 axum = { version = "0.8.9", default-features = false }
 sea-orm = "2.0.4"
 sea-orm-migration = "2.0.4"
+thiserror = "2.0.20"
 tokio = "1.53.1"
 tracing = "0.1.44"
 

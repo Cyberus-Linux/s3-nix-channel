@@ -4,10 +4,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use serde::Deserialize;
 use storage::s3::Client;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 /// The configuration that lives in the S3 bucket as /channels.json.
 #[derive(Deserialize, Debug)]
@@ -82,15 +82,17 @@ fn default_channel_file_extension() -> String {
 
 /// Load the configuration of all channels from the bucket.
 ///
-/// Channels whose configuration can't be read are skipped with an error
-/// message.
+/// Fails if the bucket has no channels.json. Channels whose configuration
+/// can't be read are skipped with an error message.
 pub async fn load_channels_config(client: &Client) -> Result<BTreeMap<String, ChannelConfig>> {
     let mut channels = BTreeMap::new();
 
-    if !client.file_exists("channels.json").await? {
-        warn!("No channels.json in bucket: Starting with empty configuration!");
-        return Ok(channels);
-    }
+    // S3 also answers "not found" if the bucket doesn't exist, so this
+    // catches typos in the bucket name, too.
+    ensure!(
+        client.file_exists("channels.json").await?,
+        "No channels.json found. Check that the bucket exists and contains the legacy configuration."
+    );
 
     let persistent_config: PersistentChannelsConfig =
         serde_json::from_slice(&client.read_file("channels.json").await?)

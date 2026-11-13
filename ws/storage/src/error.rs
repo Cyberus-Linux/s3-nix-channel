@@ -1,38 +1,42 @@
-use axum::{
-    http::{self, StatusCode},
-    response::IntoResponse,
-};
+use std::path::PathBuf;
 
+/// The underlying error of a failed bucket operation.
+pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Why an object couldn't be fetched from the bucket to serve it to a client.
 #[derive(thiserror::Error, Debug)]
-pub enum RequestError {
-    #[error("Failed to fetch object {object_key:?}")]
-    BackendFailure { object_key: String },
+pub enum FetchError {
     #[error("There is no such object: {object_key:?}")]
     NoSuchObject { object_key: String },
-    #[error("There is no such channel: {file_name:?}")]
-    NoSuchChannel { file_name: String },
-    #[error("Database error: {reason}")]
-    DatabaseFailure { reason: String },
-
-    #[error("Unsupported HTTP method: {method}")]
-    UnsupportedMethod { method: http::Method },
-    #[error("Unknown error")]
-    Unknown,
+    #[error("Failed to fetch object {object_key:?}")]
+    BackendFailure { object_key: String },
 }
 
-impl IntoResponse for RequestError {
-    fn into_response(self) -> axum::response::Response {
-        (
-            match self {
-                RequestError::NoSuchChannel { file_name: _ }
-                | RequestError::NoSuchObject { object_key: _ } => StatusCode::NOT_FOUND,
-                RequestError::DatabaseFailure { reason: _ } => StatusCode::INTERNAL_SERVER_ERROR,
-                RequestError::UnsupportedMethod { method: _ } => StatusCode::METHOD_NOT_ALLOWED,
-                RequestError::BackendFailure { object_key: _ } => StatusCode::BAD_GATEWAY,
-                RequestError::Unknown => StatusCode::INTERNAL_SERVER_ERROR,
-            },
-            format!("{}", self),
-        )
-            .into_response()
-    }
+/// Why reading, checking or uploading objects failed.
+#[derive(thiserror::Error, Debug)]
+pub enum StorageError {
+    #[error("Failed to read {object_key:?} from the bucket")]
+    Read {
+        object_key: String,
+        source: BoxError,
+    },
+    #[error("Failed to check whether {object_key:?} exists in the bucket")]
+    ExistenceCheck {
+        object_key: String,
+        source: BoxError,
+    },
+    #[error("Failed to upload {object_key:?} to the bucket")]
+    Upload {
+        object_key: String,
+        source: BoxError,
+    },
+    #[error("Refusing to overwrite {object_key:?} in the bucket")]
+    AlreadyExists { object_key: String },
+    #[error("Failed to read local file {}", path.display())]
+    LocalFile {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("{} needs a file name that is valid UTF-8", path.display())]
+    InvalidFileName { path: PathBuf },
 }

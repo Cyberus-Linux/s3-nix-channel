@@ -1,6 +1,9 @@
 mod legacy;
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{ensure, Context, Result};
 use clap::{Parser, Subcommand};
@@ -156,9 +159,10 @@ fn require_matching_extension(channel_name: &str, name: &str, force: bool) -> Re
     Ok(())
 }
 
-async fn import_legacy(s3_client: &Client, db: &DatabaseConnection) -> Result<()> {
-    let config = legacy::load_channels_config(s3_client).await?;
-
+async fn import_legacy(
+    config: BTreeMap<String, legacy::ChannelConfig>,
+    db: &DatabaseConnection,
+) -> Result<()> {
     for (channel_name, mut cfg) in config {
         if cfg.remove_previous_duplicates() {
             info!("Skipping duplicate entries in the history of {channel_name}.");
@@ -329,36 +333,36 @@ async fn main() -> Result<()> {
         .init();
 
     // Only the import is allowed to change the schema.
-    let apply_migrations = matches!(
-        args.commands,
-        Commands::ImportLegacy {
-            apply_migrations: true,
-            ..
-        }
-    );
-    let db = &connect(&args.db, apply_migrations).await?;
+    let db = || connect(&args.db, false);
 
     match args.commands {
-        Commands::ImportLegacy { bucket, .. } => {
-            let s3_client = Client::new_from_env(&bucket).await?;
-            import_legacy(&s3_client, db).await?
+        Commands::ImportLegacy {
+            bucket,
+            apply_migrations,
+        } => {
+            // Read the legacy configuration first, so a wrong bucket doesn't
+            // touch the database.
+            let s3_client = Client::new_from_env(&bucket).await;
+            let config = legacy::load_channels_config(&s3_client).await?;
+
+            import_legacy(config, &connect(&args.db, apply_migrations).await?).await?
         }
-        Commands::ListChannels => list_channels(db).await?,
-        Commands::ShowChannel { channel } => show_channel(db, &channel).await?,
-        Commands::AddChannel { channel } => add_channel(db, &channel).await?,
+        Commands::ListChannels => list_channels(&db().await?).await?,
+        Commands::ShowChannel { channel } => show_channel(&db().await?, &channel).await?,
+        Commands::AddChannel { channel } => add_channel(&db().await?, &channel).await?,
         Commands::AddAlias {
             channel,
             alias,
             force,
-        } => add_alias(db, &channel, &alias, force).await?,
+        } => add_alias(&db().await?, &channel, &alias, force).await?,
         Commands::Publish {
             bucket,
             channel,
             file,
             force,
         } => {
-            let s3_client = Client::new_from_env(&bucket).await?;
-            publish(db, &s3_client, &channel, &file, force).await?
+            let s3_client = Client::new_from_env(&bucket).await;
+            publish(&db().await?, &s3_client, &channel, &file, force).await?
         }
     }
 

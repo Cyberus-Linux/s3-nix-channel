@@ -2,19 +2,14 @@
 
 use std::path::Path;
 
-use anyhow::{anyhow, bail, Context, Result};
 use aws_sdk_s3::{
     config::http::HttpResponse,
     error::{DisplayErrorContext, SdkError},
     primitives::{ByteStream, DateTime, DateTimeFormat},
 };
-use axum::{
-    body::Bytes,
-    http::{self, Method},
-};
 use tracing::error;
 
-use crate::error::RequestError;
+use crate::error::{BoxError, FetchError, StorageError};
 
 /// An object fetched from the bucket, ready to be passed on to a client.
 pub struct Object {
@@ -38,46 +33,52 @@ pub enum Fetched {
     },
 }
 
+/// How much of an object to fetch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchMethod {
+    /// Metadata and content (HTTP `GET`).
+    Get,
+    /// Only the metadata (HTTP `HEAD`).
+    Head,
+}
+
 /// Conditional request headers from the client that we pass on to S3.
+///
+/// These are the raw header values.
 #[derive(Debug, Default)]
 pub struct Conditions {
     pub if_none_match: Option<String>,
-    pub if_modified_since: Option<DateTime>,
+    pub if_modified_since: Option<String>,
 }
 
-impl Conditions {
-    /// Extract the conditions from the client's request headers.
-    ///
-    /// Headers that can't be parsed are ignored, which makes the request
-    /// unconditional, as required by RFC 9110.
-    pub fn from_headers(headers: &http::HeaderMap) -> Conditions {
-        let get = |name| headers.get(name).and_then(|v| v.to_str().ok());
-
-        Conditions {
-            if_none_match: get(http::header::IF_NONE_MATCH).map(str::to_owned),
-            if_modified_since: get(http::header::IF_MODIFIED_SINCE)
-                .and_then(|s| DateTime::from_str(s, DateTimeFormat::HttpDate).ok()),
-        }
-    }
+/// Parse an HTTP date.
+///
+/// Dates that can't be parsed are ignored, which makes the request
+/// unconditional, as required by RFC 9110.
+fn parse_http_date(date: &str) -> Option<DateTime> {
+    DateTime::from_str(date, DateTimeFormat::HttpDate).ok()
 }
 
 fn format_http_date(date: DateTime) -> Option<String> {
     date.fmt(DateTimeFormat::HttpDate).ok()
 }
 
-/// Turn a failed S3 request into a "not modified" answer or a request error.
+/// S3's answer to a conditional request whose condition failed.
+const HTTP_NOT_MODIFIED: u16 = 304;
+
+/// Turn a failed S3 request into a "not modified" answer or a fetch error.
 fn handle_fetch_error<E>(
     err: SdkError<E, HttpResponse>,
     is_not_found: impl FnOnce(&E) -> bool,
     object_key: &str,
-) -> Result<Fetched, RequestError>
+) -> Result<Fetched, FetchError>
 where
     E: std::error::Error + 'static,
 {
     // The SDK treats S3's 304 answer to a conditional request as an error.
     if let Some(raw) = err
         .raw_response()
-        .filter(|r| r.status().as_u16() == http::StatusCode::NOT_MODIFIED.as_u16())
+        .filter(|r| r.status().as_u16() == HTTP_NOT_MODIFIED)
     {
         let header = |name: &str| raw.headers().get(name).map(str::to_owned);
 
@@ -88,7 +89,7 @@ where
     }
 
     if err.as_service_error().is_some_and(is_not_found) {
-        return Err(RequestError::NoSuchObject {
+        return Err(FetchError::NoSuchObject {
             object_key: object_key.to_owned(),
         });
     }
@@ -97,7 +98,7 @@ where
         "Failed to fetch {object_key:?} from bucket: {}",
         DisplayErrorContext(&err)
     );
-    Err(RequestError::BackendFailure {
+    Err(FetchError::BackendFailure {
         object_key: object_key.to_owned(),
     })
 }
@@ -109,24 +110,27 @@ pub struct Client {
 
 impl Client {
     /// Open an S3 client with configuration from the environment.
-    // TODO Return a custom error type.
-    pub async fn new_from_env(bucket: &str) -> Result<Client> {
+    pub async fn new_from_env(bucket: &str) -> Client {
         let amzn_config = aws_config::load_from_env().await;
         let s3_config = aws_sdk_s3::config::Builder::from(&amzn_config)
             // TODO For minio compat. Should this be configurable?
             .force_path_style(true)
             .build();
 
-        Ok(Self {
+        Self {
             client: aws_sdk_s3::Client::from_conf(s3_config),
             bucket: bucket.to_owned(),
-        })
+        }
     }
 
     /// Read a file from S3 into memory. This should only be used for
     /// small files.
-    // TODO Return a custom error type.
-    pub async fn read_file(&self, object_key: &str) -> Result<Bytes> {
+    pub async fn read_file(&self, object_key: &str) -> Result<Vec<u8>, StorageError> {
+        let read_error = |source: BoxError| StorageError::Read {
+            object_key: object_key.to_owned(),
+            source,
+        };
+
         let response = self
             .client
             .get_object()
@@ -134,36 +138,46 @@ impl Client {
             .key(object_key)
             .send()
             .await
-            // TODO Better error.
-            .with_context(|| format!("Failed to read: {object_key}"))?;
+            .map_err(|e| read_error(e.into()))?;
 
-        Ok(response.body.collect().await?.into_bytes())
+        let data = response
+            .body
+            .collect()
+            .await
+            .map_err(|e| read_error(e.into()))?;
+
+        Ok(data.to_vec())
     }
 
     /// Fetch an object from the bucket so it can be served to a client.
     ///
-    /// For `HEAD` requests, only the metadata is fetched and the returned
+    /// For [`FetchMethod::Head`], only the metadata is fetched and the returned
     /// object has no body. The `conditions` are passed on to S3, which
     /// decides whether the client's cached copy is still current.
     ///
-    /// A missing object is only reported as [`RequestError::NoSuchObject`] if
+    /// A missing object is only reported as [`FetchError::NoSuchObject`] if
     /// the credentials allow `s3:ListBucket`. Otherwise, S3 answers with
     /// "access denied", which we report as a backend failure.
     pub async fn fetch_object(
         &self,
-        method: http::Method,
+        method: FetchMethod,
         object_key: &str,
         conditions: Conditions,
-    ) -> Result<Fetched, RequestError> {
+    ) -> Result<Fetched, FetchError> {
+        let if_modified_since = conditions
+            .if_modified_since
+            .as_deref()
+            .and_then(parse_http_date);
+
         match method {
-            Method::GET => {
+            FetchMethod::Get => {
                 let result = self
                     .client
                     .get_object()
                     .bucket(&self.bucket)
                     .key(object_key)
                     .set_if_none_match(conditions.if_none_match)
-                    .set_if_modified_since(conditions.if_modified_since)
+                    .set_if_modified_since(if_modified_since)
                     .send()
                     .await;
 
@@ -178,14 +192,14 @@ impl Client {
                     Err(e) => handle_fetch_error(e, |se| se.is_no_such_key(), object_key),
                 }
             }
-            Method::HEAD => {
+            FetchMethod::Head => {
                 let result = self
                     .client
                     .head_object()
                     .bucket(&self.bucket)
                     .key(object_key)
                     .set_if_none_match(conditions.if_none_match)
-                    .set_if_modified_since(conditions.if_modified_since)
+                    .set_if_modified_since(if_modified_since)
                     .send()
                     .await;
 
@@ -200,19 +214,19 @@ impl Client {
                     Err(e) => handle_fetch_error(e, |se| se.is_not_found(), object_key),
                 }
             }
-            unsupported => Err(RequestError::UnsupportedMethod {
-                method: unsupported,
-            }),
         }
     }
 
     /// Upload a file to the persistent store. Doesn't update any channel.
-    async fn write_file(&self, object_key: &str, file: &Path) -> Result<()> {
+    async fn write_file(&self, object_key: &str, file: &Path) -> Result<(), StorageError> {
         // We would want to stream the file and not load it all in
         // memory, but it results in XAmzContentSHA256Mismatch. :(
         let data = tokio::fs::read(file)
             .await
-            .context("Failed to read input file")?;
+            .map_err(|source| StorageError::LocalFile {
+                path: file.to_owned(),
+                source,
+            })?;
 
         self.client
             .put_object()
@@ -221,13 +235,16 @@ impl Client {
             .body(data.into())
             .send()
             .await
-            .with_context(|| format!("Failed to upload file: {}", file.display()))?;
+            .map_err(|e| StorageError::Upload {
+                object_key: object_key.to_owned(),
+                source: e.into(),
+            })?;
 
         Ok(())
     }
 
     /// Check whether an object exists in the bucket.
-    pub async fn file_exists(&self, object_key: &str) -> Result<bool> {
+    pub async fn file_exists(&self, object_key: &str) -> Result<bool, StorageError> {
         match self
             .client
             .head_object()
@@ -237,29 +254,28 @@ impl Client {
             .await
         {
             Ok(_) => Ok(true),
-            Err(err) => {
-                if err.as_service_error().map(|e| e.is_not_found()) == Some(true) {
-                    Ok(false)
-                } else {
-                    Err(anyhow!("Failed to check if object exists: {err}"))
-                }
-            }
+            Err(err) if err.as_service_error().is_some_and(|e| e.is_not_found()) => Ok(false),
+            Err(err) => Err(StorageError::ExistenceCheck {
+                object_key: object_key.to_owned(),
+                source: err.into(),
+            }),
         }
     }
 
     /// Upload a file to the bucket, using its file name as object key.
     ///
     /// Refuses to overwrite existing objects. Returns the object key.
-    pub async fn upload_new_file(&self, file: &Path) -> Result<String> {
+    pub async fn upload_new_file(&self, file: &Path) -> Result<String, StorageError> {
         let object_key = file
             .file_name()
-            .ok_or_else(|| anyhow!("No file name: {}", file.display()))?
-            .to_str()
-            .ok_or_else(|| anyhow!("File name needs to be valid UTF-8: {}", file.display()))?
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| StorageError::InvalidFileName {
+                path: file.to_owned(),
+            })?
             .to_owned();
 
         if self.file_exists(&object_key).await? {
-            bail!("Refusing to overwrite key: {object_key}");
+            return Err(StorageError::AlreadyExists { object_key });
         }
 
         self.write_file(&object_key, file).await?;
@@ -273,32 +289,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn conditions_from_headers() {
-        let mut headers = http::HeaderMap::new();
-        assert!(Conditions::from_headers(&headers).if_none_match.is_none());
-        assert!(Conditions::from_headers(&headers)
-            .if_modified_since
-            .is_none());
-
-        headers.insert(http::header::IF_NONE_MATCH, "\"abc\"".parse().unwrap());
-        headers.insert(
-            http::header::IF_MODIFIED_SINCE,
-            "Wed, 21 Oct 2015 07:28:00 GMT".parse().unwrap(),
-        );
-        let conditions = Conditions::from_headers(&headers);
-        assert_eq!(conditions.if_none_match.as_deref(), Some("\"abc\""));
+    fn parse_http_date_works() {
         assert_eq!(
-            conditions.if_modified_since,
+            parse_http_date("Wed, 21 Oct 2015 07:28:00 GMT"),
             Some(DateTime::from_secs(1445412480))
         );
 
         // Unparseable dates make the request unconditional.
-        headers.insert(
-            http::header::IF_MODIFIED_SINCE,
-            "yesterday".parse().unwrap(),
-        );
-        assert!(Conditions::from_headers(&headers)
-            .if_modified_since
-            .is_none());
+        assert_eq!(parse_http_date("yesterday"), None);
     }
 }
