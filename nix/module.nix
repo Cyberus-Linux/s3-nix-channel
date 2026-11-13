@@ -48,16 +48,6 @@ in {
         ```
       '';
     };
-
-    jwtPublicKey = lib.mkOption {
-      type = lib.types.nullOr lib.types.path;
-      default = null;
-      description = ''
-        Path to a RSA public key in PEM file. If this option is specified,
-        the service will require a valid JWT token to respond to requests.
-        JWT tokens must be sent via the password field of HTTP Basic Auth.
-      '';
-    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -83,9 +73,7 @@ in {
         ExecStart = ''
           ${lib.getExe cfg.package} \
             --bucket ${cfg.bucket}  \
-            --base-url ${cfg.baseUrl} \
-            ${lib.optionalString (cfg.jwtPublicKey != null)
-              "--jwt-pem \${CREDENTIALS_DIRECTORY}/pem"}
+            --base-url ${cfg.baseUrl}
         '';
 
         DynamicUser = true;
@@ -114,8 +102,6 @@ in {
         UMask = "0077";
 
         EnvironmentFile = cfg.secretsFile;
-      } // lib.optionalAttrs (cfg.jwtPublicKey != null) {
-        LoadCredential = "pem:${cfg.jwtPublicKey}";
       };
     };
   };
