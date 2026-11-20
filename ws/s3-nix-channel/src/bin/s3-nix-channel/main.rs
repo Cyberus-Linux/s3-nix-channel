@@ -62,7 +62,10 @@ struct Args {
     /// https://www.sea-ql.org/SeaORM/docs/install-and-config/connection/
     ///
     /// For postgres this can look like: postgres://username:password@host/database
-    #[arg(long)]
+    ///
+    /// Prefer passing URLs that contain passwords via the environment, so they
+    /// don't show up in the process list.
+    #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
     db: String,
 }
 
