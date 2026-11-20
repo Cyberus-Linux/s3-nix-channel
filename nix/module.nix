@@ -1,6 +1,12 @@
 { config, lib, pkgs, ... }:
 let
   cfg = config.services.s3-nix-channel;
+
+  # The service user, local database, and database user share this name, so
+  # PostgreSQL's peer authentication works without a password.
+  name = "s3-nix-channel";
+  localDatabaseUrl = "postgres://${name}@localhost/${name}?host=/run/postgresql";
+  databaseUrl = if cfg.database.createLocally then localDatabaseUrl else cfg.database.url;
 in {
   options.services.s3-nix-channel = {
     enable = lib.mkEnableOption "Enables the s3-nix-channel service";
@@ -46,6 +52,10 @@ in {
         AWS_REGION=...
         AWS_ENDPOINT_URL=...
         ```
+
+        To use an external database whose URL contains a password, add
+        `DATABASE_URL=...` here. It takes precedence over
+        {option}`services.s3-nix-channel.database.url`.
       '';
     };
   };

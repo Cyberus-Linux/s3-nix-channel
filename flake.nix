@@ -25,9 +25,8 @@
       ];
 
       nixosModules.default =
-        {
-          pkgs,
-          ...
+        { pkgs
+        , ...
         }:
         {
           imports = [
@@ -110,12 +109,32 @@
           inherit inputs pkgs;
 
           modules = [
-            (
+
+            ({ lib
+             , config
+             , ...
+             }:
+              let
+                isPure = builtins.getEnv "PWD" == "";
+                dummyRoot = "/tmp/devenv-pure-eval-fallback";
+
+              in
               {
-                pkgs,
-                config,
-                ...
-              }:
+                devenv.root = if isPure then dummyRoot else builtins.getEnv "PWD";
+
+                enterShell = lib.mkIf (config.devenv.root == dummyRoot) ''
+                  echo >&2
+                  echo "ERROR: Pure evaluation detected (DEVENV_ROOT is unset)." >&2
+                  echo "       Can't proceed. This is a devenv limitation." >&2
+                  echo >&2
+                  echo "Re-run with: nix develop --impure" >&2
+                  exit 1
+                '';
+              })
+            ({ pkgs
+             , config
+             , ...
+             }:
               {
                 packages = [ pkgs.sea-orm-cli ];
 
