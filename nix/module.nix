@@ -173,8 +173,7 @@ in {
         ProtectKernelTunables = true;
         ProtectKernelModules = true;
         ProtectKernelLogs = true;
-        # TODO This can be strict on systemd 257. But 24.11 still has 256.
-        ProtectControlGroups = true;
+        ProtectControlGroups = "strict";
         ProtectHome = true;
         LockPersonality = true;
         MemoryDenyWriteExecute = true;
