@@ -13,7 +13,10 @@ use migration::MigratorTrait;
 use sea_orm::{
     prelude::*, ActiveValue::Set, Database, DatabaseConnection, IntoActiveModel, QueryOrder,
 };
-use storage::{hash::Sha256, s3::Client};
+use storage::{
+    hash::{hash_file, Sha256},
+    s3::Client,
+};
 use tracing::{info, warn};
 
 #[derive(Subcommand, Debug)]
@@ -363,6 +366,27 @@ async fn publish(
         .to_string_lossy();
 
     require_matching_extension(channel_name, &file_name, force)?;
+
+    // Publishing the newest update again is a no-op. This makes it safe to
+    // retry publishing.
+    if let Some(latest_id) = channel.latest_update_id {
+        let latest = update::Entity::find_by_id(latest_id)
+            .one(db)
+            .await?
+            .with_context(|| format!("Latest update {latest_id} of {channel_name} is missing"))?;
+
+        let local_sha256 = hash_file(file)
+            .await
+            .with_context(|| format!("Failed to hash {}", file.display()))?;
+
+        if latest.sha256 == local_sha256.as_bytes() {
+            println!(
+                "Channel {channel_name} already points to {} (SHA-256 {local_sha256}). Nothing to do.",
+                latest.persistent_file
+            );
+            return Ok(());
+        }
+    }
 
     let uploaded = s3_client.upload_new_file(file).await?;
 

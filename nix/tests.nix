@@ -236,8 +236,14 @@ in
       # Check adding a channel works
       servePublic.succeed(upload("add-channel new-24.05.txt"))
 
-      # Fail to upload duplicate files
-      servePublic.fail(upload("publish ${bucket} install-24.05.iso content/media-1235.iso"))
+      # Publishing the newest update again is a successful no-op.
+      assert "Nothing to do" in servePublic.succeed(upload("publish ${bucket} install-24.05.iso content/media-1235.iso"))
+      servePublic.succeed("curl -vL http://localhost/channel/install-24.05.iso > latest-again.iso")
+      servePublic.succeed("cmp content/media-1235.iso latest-again.iso")
+
+      # Fail to upload files that already exist in the bucket, but are not the
+      # newest update.
+      servePublic.fail(upload("publish ${bucket} install-24.05.iso content/media-1234.iso"))
 
       # Fail to add duplicate channel
       servePublic.fail(upload("add-channel install-24.05.iso"))

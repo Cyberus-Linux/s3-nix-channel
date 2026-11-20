@@ -1,6 +1,10 @@
-use std::fmt;
+use std::{fmt, path::Path};
 
 use sha2::Digest;
+use tokio::io::AsyncReadExt;
+
+/// How much of a local file we read at once while hashing it.
+const READ_CHUNK_SIZE: usize = 1 << 20;
 
 /// A SHA-256 hash.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -43,6 +47,24 @@ impl fmt::Display for Sha256 {
 impl fmt::Debug for Sha256 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Sha256({self})")
+    }
+}
+
+/// Compute the SHA-256 hash of a local file.
+///
+/// The file is streamed, so this also works for large files.
+pub async fn hash_file(path: &Path) -> std::io::Result<Sha256> {
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut hasher = Hasher::default();
+    let mut buffer = vec![0; READ_CHUNK_SIZE];
+
+    loop {
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            return Ok(hasher.finalize());
+        }
+
+        hasher.update(&buffer[..read]);
     }
 }
 
