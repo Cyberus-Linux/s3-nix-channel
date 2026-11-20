@@ -5,8 +5,36 @@ let
   # The service user, local database, and database user share this name, so
   # PostgreSQL's peer authentication works without a password.
   name = "s3-nix-channel";
-  localDatabaseUrl = "postgres://${name}@localhost/${name}?host=/run/postgresql";
-  databaseUrl = if cfg.database.createLocally then localDatabaseUrl else cfg.database.url;
+
+  createDatabaseLocally = cfg.database.url == null;
+  databaseUrl =
+    if createDatabaseLocally then
+      "postgres://${name}@localhost/${name}?host=/run/postgresql"
+    else
+      cfg.database.url;
+
+  # Run s3-nix-channel-upload with the same configuration as the service.
+  adminWrapper = pkgs.writeShellApplication {
+    name = "s3-nix-channel-admin";
+    runtimeInputs = [ pkgs.util-linux ];
+    text = ''
+      if [ "$(id -u)" -ne 0 ]; then
+        echo "s3-nix-channel-admin needs to run as root." >&2
+        exit 1
+      fi
+
+      export DATABASE_URL=${lib.escapeShellArg databaseUrl}
+
+      # Load the S3 credentials and, for external databases, PGPASSWORD.
+      set -a
+      # shellcheck source=/dev/null
+      source ${lib.escapeShellArg cfg.secretsFile}
+      set +a
+
+      # Files to publish must be readable by this user.
+      exec runuser -u ${name} -- ${lib.getExe' cfg.package "s3-nix-channel-upload"} "$@"
+    '';
+  };
 in {
   options.services.s3-nix-channel = {
     enable = lib.mkEnableOption "Enables the s3-nix-channel service";
@@ -53,14 +81,52 @@ in {
         AWS_ENDPOINT_URL=...
         ```
 
-        To use an external database whose URL contains a password, add
-        `DATABASE_URL=...` here. It takes precedence over
-        {option}`services.s3-nix-channel.database.url`.
+        If the database configured in
+        {option}`services.s3-nix-channel.database.url` needs a password, add
+        `PGPASSWORD=...` here.
+      '';
+    };
+
+    database.url = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "postgres://s3-nix-channel@db.example.com/s3-nix-channel?sslmode=verify-full";
+      description = ''
+        URL of an external PostgreSQL database. See
+        https://www.sea-ql.org/SeaORM/docs/install-and-config/connection/
+        for the format.
+
+        If this is `null`, a local PostgreSQL database is created and used via
+        its Unix socket and peer authentication.
+
+        This ends up in the world-readable Nix store, so it must not contain
+        a password. Put `PGPASSWORD=...` into
+        {option}`services.s3-nix-channel.secretsFile` instead.
       '';
     };
   };
 
   config = lib.mkIf cfg.enable {
+    users.users.${name} = {
+      isSystemUser = true;
+      group = name;
+    };
+    users.groups.${name} = { };
+
+    # For managing channels. See s3-nix-channel-admin --help.
+    environment.systemPackages = [ adminWrapper ];
+
+    services.postgresql = lib.mkIf createDatabaseLocally {
+      enable = true;
+      ensureDatabases = [ name ];
+      ensureUsers = [
+        {
+          inherit name;
+          ensureDBOwnership = true;
+        }
+      ];
+    };
+
     systemd.sockets.s3-nix-channel = {
       wantedBy = [ "sockets.target" ];
       socketConfig = {
@@ -73,8 +139,12 @@ in {
       description = "Nix Tarball Serve";
       wantedBy = [ "multi-user.target" ];
 
-      after = [ "network.target" ];
-      requires = [ "s3-nix-channel.socket" ];
+      after = [ "network.target" ]
+        ++ lib.optionals createDatabaseLocally [ "postgresql.target" ];
+      requires = [ "s3-nix-channel.socket" ]
+        ++ lib.optionals createDatabaseLocally [ "postgresql.target" ];
+
+      environment.DATABASE_URL = databaseUrl;
 
       serviceConfig = {
         Type = "notify";
@@ -86,7 +156,12 @@ in {
             --base-url ${cfg.baseUrl}
         '';
 
-        DynamicUser = true;
+        User = name;
+        Group = name;
+
+        NoNewPrivileges = true;
+        PrivateTmp = true;
+        RemoveIPC = true;
         ProtectProc = "invisible";
         ProtectSystem = "strict";
         PrivateDevices = true;

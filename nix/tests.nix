@@ -60,9 +60,6 @@ let
       '';
 
       environment.systemPackages = with pkgs; [
-        # For tarball uploads.
-        config.services.s3-nix-channel.package
-
         git
         jq
       ];
@@ -120,6 +117,10 @@ in
     };
 
     testScript = ''
+      def upload(args):
+          """The command line to manage channels with the given arguments."""
+          return f"s3-nix-channel-admin {args}"
+
       s3.start()
       s3.wait_for_unit("garage.service")
       s3.wait_for_open_port(3901)
@@ -157,11 +158,11 @@ in
       servePublic.copy_from_host("${isoImage}/media-1234.iso", "content/media-1234.iso")
       servePublic.copy_from_host("${isoImage}/media-1235.iso", "content/media-1235.iso")
 
-      servePublic.succeed("env $(cat ${secretsFile}) s3-nix-channel-upload add-channel ${bucket} thechannel-24.05 .tar.xz")
-      servePublic.succeed("env $(cat ${secretsFile}) s3-nix-channel-upload add-channel ${bucket} install-24.05 .iso")
+      servePublic.succeed(upload("add-channel thechannel-24.05.tar.xz"))
+      servePublic.succeed(upload("add-channel install-24.05.iso"))
 
-      servePublic.succeed("env $(cat ${secretsFile}) s3-nix-channel-upload publish ${bucket} thechannel-24.05 content/tarball-1234.tar.xz")
-      servePublic.succeed("env $(cat ${secretsFile}) s3-nix-channel-upload publish ${bucket} install-24.05 content/media-1234.iso")
+      servePublic.succeed(upload("publish ${bucket} thechannel-24.05.tar.xz content/tarball-1234.tar.xz"))
+      servePublic.succeed(upload("publish ${bucket} install-24.05.iso content/media-1234.iso"))
 
       servePublic.succeed("curl -vL http://localhost/channel/thechannel-24.05.tar.xz > latest.tar.xz")
       servePublic.succeed("curl -vL http://localhost/permanent/tarball-1234.tar.xz > permanent.tar.xz")
@@ -200,17 +201,18 @@ in
       servePublic.succeed("cmp content/media-1234.iso permanent.iso")
 
       # Add an alias
-      servePublic.succeed("env $(cat ${secretsFile}) s3-nix-channel-upload add-alias ${bucket} thechannel-24.05 foobar-24.05")
+      servePublic.succeed(upload("add-alias thechannel-24.05.tar.xz foobar-24.05.tar.xz"))
 
       # Fail to add names that are already in use, such as other channel names.
-      servePublic.fail("env $(cat ${secretsFile}) s3-nix-channel-upload add-alias ${bucket} thechannel-24.05 install-24.05")
+      # --force skips the extension check, so only the duplicate name can fail.
+      servePublic.fail(upload("add-alias --force thechannel-24.05.tar.xz install-24.05.iso"))
 
       # Can fetch via alias
       servePublic.succeed("curl -vL http://localhost/channel/foobar-24.05.tar.xz > alias.tar.xz")
       servePublic.succeed("cmp content/tarball-1234.tar.xz alias.tar.xz")
 
       # Can publish via alias
-      servePublic.succeed("env $(cat ${secretsFile}) s3-nix-channel-upload publish ${bucket} foobar-24.05 content/tarball-1235.tar.xz")
+      servePublic.succeed(upload("publish ${bucket} foobar-24.05.tar.xz content/tarball-1235.tar.xz"))
       servePublic.succeed("curl -vL http://localhost/channel/foobar-24.05.tar.xz > alias-new.tar.xz")
       servePublic.succeed("cmp content/tarball-1235.tar.xz alias-new.tar.xz")
       servePublic.succeed("curl -vL http://localhost/channel/thechannel-24.05.tar.xz > alias-new2.tar.xz")
@@ -225,19 +227,19 @@ in
       assert "http://localhost/permanent/tarball-1235.tar.xz\n" == servePublic.succeed("jq -r .nodes.thechannel.locked.url flake/flake.lock")
 
       # Check whether we can update the tarball.
-      print(servePublic.succeed("env $(cat ${secretsFile}) s3-nix-channel-upload publish ${bucket} thechannel-24.05 content/tarball-1236.tar.xz"))
+      print(servePublic.succeed(upload("publish ${bucket} thechannel-24.05.tar.xz content/tarball-1236.tar.xz")))
 
       # Check whether we can update files with different extensions as well.
-      print(servePublic.succeed("env $(cat ${secretsFile}) s3-nix-channel-upload publish ${bucket} install-24.05 content/media-1235.iso"))
+      print(servePublic.succeed(upload("publish ${bucket} install-24.05.iso content/media-1235.iso")))
 
       # Check adding a channel works
-      servePublic.succeed("env $(cat ${secretsFile}) s3-nix-channel-upload add-channel ${bucket} new-24.05 txt")
+      servePublic.succeed(upload("add-channel new-24.05.txt"))
 
       # Fail to upload duplicate files
-      servePublic.fail("env $(cat ${secretsFile}) s3-nix-channel-upload publish ${bucket} install-24.05 content/media-1235.iso")
+      servePublic.fail(upload("publish ${bucket} install-24.05.iso content/media-1235.iso"))
 
       # Fail to add duplicate channel
-      servePublic.fail("env $(cat ${secretsFile}) s3-nix-channel-upload add-channel ${bucket} install-24.05 iso")
+      servePublic.fail(upload("add-channel install-24.05.iso"))
 
       # Check whether the flake updates to the new version
       servePublic.succeed("cd flake ; nix flake update")
