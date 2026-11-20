@@ -81,6 +81,11 @@ in {
         AWS_ENDPOINT_URL=...
         ```
 
+        Endpoints using plain HTTP (`http://...`) are rejected unless you also
+        add `AWS_ALLOW_HTTP=true`. See the documentation of
+        [`AmazonS3Builder::from_env`](https://docs.rs/object_store/latest/object_store/aws/struct.AmazonS3Builder.html#method.from_env)
+        for all supported variables.
+
         If the database configured in
         {option}`services.s3-nix-channel.database.url` needs a password, add
         `PGPASSWORD=...` here.

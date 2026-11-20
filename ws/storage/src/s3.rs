@@ -2,11 +2,15 @@
 
 use std::path::Path;
 
-use aws_sdk_s3::{
-    config::http::HttpResponse,
-    error::{DisplayErrorContext, SdkError},
-    primitives::{ByteStream, DateTime, DateTimeFormat},
+use bytes::Bytes;
+use chrono::{DateTime, Utc};
+use futures::{stream::BoxStream, TryStreamExt};
+use object_store::{
+    aws::{AmazonS3, AmazonS3Builder},
+    path::Path as ObjectPath,
+    Attribute, GetOptions, ObjectStore, ObjectStoreExt, WriteMultipart,
 };
+use tokio::io::AsyncReadExt;
 use tracing::error;
 
 use crate::{
@@ -14,21 +18,30 @@ use crate::{
     hash::{Hasher, Sha256},
 };
 
+/// How much of a local file we read at once while uploading it.
+const UPLOAD_CHUNK_SIZE: usize = 1 << 20;
+
+/// How many parts of a multipart upload we send at the same time.
+const UPLOAD_CONCURRENCY: usize = 4;
+
 /// A file that was uploaded to the bucket.
 pub struct UploadedFile {
     pub object_key: String,
     pub sha256: Sha256,
 }
 
+/// The content of an object, streamed from the bucket.
+pub type ObjectStream = BoxStream<'static, Result<Bytes, object_store::Error>>;
+
 /// An object fetched from the bucket, ready to be passed on to a client.
 pub struct Object {
-    pub content_length: Option<i64>,
+    pub content_length: u64,
     pub content_type: Option<String>,
     pub etag: Option<String>,
     /// Last modification time formatted as HTTP date.
-    pub last_modified: Option<String>,
+    pub last_modified: String,
     /// The content of the object. This is `None` for `HEAD` requests.
-    pub body: Option<ByteStream>,
+    pub body: Option<ObjectStream>,
 }
 
 /// The result of fetching an object from the bucket.
@@ -37,8 +50,9 @@ pub enum Fetched {
     Found(Object),
     /// The client's cached copy is still current (HTTP 304).
     NotModified {
+        /// The client's `If-None-Match` value, if it sent one. S3's own answer
+        /// isn't available.
         etag: Option<String>,
-        last_modified: Option<String>,
     },
 }
 
@@ -64,96 +78,52 @@ pub struct Conditions {
 ///
 /// Dates that can't be parsed are ignored, which makes the request
 /// unconditional, as required by RFC 9110.
-fn parse_http_date(date: &str) -> Option<DateTime> {
-    DateTime::from_str(date, DateTimeFormat::HttpDate).ok()
+fn parse_http_date(date: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc2822(date)
+        .ok()
+        .map(|date| date.with_timezone(&Utc))
 }
 
-fn format_http_date(date: DateTime) -> Option<String> {
-    date.fmt(DateTimeFormat::HttpDate).ok()
-}
-
-/// S3's answer to a conditional request whose condition failed.
-const HTTP_NOT_MODIFIED: u16 = 304;
-
-/// Turn a failed S3 request into a "not modified" answer or a fetch error.
-fn handle_fetch_error<E>(
-    err: SdkError<E, HttpResponse>,
-    is_not_found: impl FnOnce(&E) -> bool,
-    object_key: &str,
-) -> Result<Fetched, FetchError>
-where
-    E: std::error::Error + 'static,
-{
-    // The SDK treats S3's 304 answer to a conditional request as an error.
-    if let Some(raw) = err
-        .raw_response()
-        .filter(|r| r.status().as_u16() == HTTP_NOT_MODIFIED)
-    {
-        let header = |name: &str| raw.headers().get(name).map(str::to_owned);
-
-        return Ok(Fetched::NotModified {
-            etag: header("etag"),
-            last_modified: header("last-modified"),
-        });
-    }
-
-    if err.as_service_error().is_some_and(is_not_found) {
-        return Err(FetchError::NoSuchObject {
-            object_key: object_key.to_owned(),
-        });
-    }
-
-    error!(
-        "Failed to fetch {object_key:?} from bucket: {}",
-        DisplayErrorContext(&err)
-    );
-    Err(FetchError::BackendFailure {
-        object_key: object_key.to_owned(),
-    })
+fn format_http_date(date: DateTime<Utc>) -> String {
+    date.format("%a, %d %b %Y %H:%M:%S GMT").to_string()
 }
 
 pub struct Client {
-    client: aws_sdk_s3::Client,
-    bucket: String,
+    store: AmazonS3,
 }
 
 impl Client {
     /// Open an S3 client with configuration from the environment.
-    pub async fn new_from_env(bucket: &str) -> Client {
-        let amzn_config = aws_config::load_from_env().await;
-        let s3_config = aws_sdk_s3::config::Builder::from(&amzn_config)
-            // TODO For minio compat. Should this be configurable?
-            .force_path_style(true)
-            .build();
+    ///
+    /// See [`AmazonS3Builder::from_env`] for the supported variables, such as
+    /// `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, and
+    /// `AWS_ENDPOINT_URL`. Endpoints using plain HTTP also need
+    /// `AWS_ALLOW_HTTP=true`.
+    pub fn new_from_env(bucket: &str) -> Result<Client, StorageError> {
+        let store = AmazonS3Builder::from_env()
+            .with_bucket_name(bucket)
+            .build()
+            .map_err(|e| StorageError::Configuration { source: e.into() })?;
 
-        Self {
-            client: aws_sdk_s3::Client::from_conf(s3_config),
-            bucket: bucket.to_owned(),
-        }
+        Ok(Self { store })
     }
 
     /// Read a file from S3 into memory. This should only be used for
     /// small files.
     pub async fn read_file(&self, object_key: &str) -> Result<Vec<u8>, StorageError> {
-        let read_error = |source: BoxError| StorageError::Read {
+        let read_error = |source: object_store::Error| StorageError::Read {
             object_key: object_key.to_owned(),
-            source,
+            source: source.into(),
         };
 
-        let response = self
-            .client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(object_key)
-            .send()
+        let data = self
+            .store
+            .get(&ObjectPath::from(object_key))
             .await
-            .map_err(|e| read_error(e.into()))?;
-
-        let data = response
-            .body
-            .collect()
+            .map_err(read_error)?
+            .bytes()
             .await
-            .map_err(|e| read_error(e.into()))?;
+            .map_err(read_error)?;
 
         Ok(data.to_vec())
     }
@@ -173,55 +143,42 @@ impl Client {
         object_key: &str,
         conditions: Conditions,
     ) -> Result<Fetched, FetchError> {
-        let if_modified_since = conditions
-            .if_modified_since
-            .as_deref()
-            .and_then(parse_http_date);
+        let options = GetOptions {
+            if_none_match: conditions.if_none_match.clone(),
+            if_modified_since: conditions
+                .if_modified_since
+                .as_deref()
+                .and_then(parse_http_date),
+            head: method == FetchMethod::Head,
+            ..GetOptions::default()
+        };
 
-        match method {
-            FetchMethod::Get => {
-                let result = self
-                    .client
-                    .get_object()
-                    .bucket(&self.bucket)
-                    .key(object_key)
-                    .set_if_none_match(conditions.if_none_match)
-                    .set_if_modified_since(if_modified_since)
-                    .send()
-                    .await;
-
-                match result {
-                    Ok(response) => Ok(Fetched::Found(Object {
-                        content_length: response.content_length,
-                        content_type: response.content_type,
-                        etag: response.e_tag,
-                        last_modified: response.last_modified.and_then(format_http_date),
-                        body: Some(response.body),
-                    })),
-                    Err(e) => handle_fetch_error(e, |se| se.is_no_such_key(), object_key),
-                }
-            }
-            FetchMethod::Head => {
-                let result = self
-                    .client
-                    .head_object()
-                    .bucket(&self.bucket)
-                    .key(object_key)
-                    .set_if_none_match(conditions.if_none_match)
-                    .set_if_modified_since(if_modified_since)
-                    .send()
-                    .await;
-
-                match result {
-                    Ok(response) => Ok(Fetched::Found(Object {
-                        content_length: response.content_length,
-                        content_type: response.content_type,
-                        etag: response.e_tag,
-                        last_modified: response.last_modified.and_then(format_http_date),
-                        body: None,
-                    })),
-                    Err(e) => handle_fetch_error(e, |se| se.is_not_found(), object_key),
-                }
+        match self
+            .store
+            .get_opts(&ObjectPath::from(object_key), options)
+            .await
+        {
+            Ok(result) => Ok(Fetched::Found(Object {
+                content_length: result.meta.size,
+                content_type: result
+                    .attributes
+                    .get(&Attribute::ContentType)
+                    .map(|value| value.to_string()),
+                etag: result.meta.e_tag.clone(),
+                last_modified: format_http_date(result.meta.last_modified),
+                body: (method == FetchMethod::Get).then(|| result.into_stream()),
+            })),
+            Err(object_store::Error::NotModified { .. }) => Ok(Fetched::NotModified {
+                etag: conditions.if_none_match,
+            }),
+            Err(object_store::Error::NotFound { .. }) => Err(FetchError::NoSuchObject {
+                object_key: object_key.to_owned(),
+            }),
+            Err(err) => {
+                error!("Failed to fetch {object_key:?} from bucket: {err}");
+                Err(FetchError::BackendFailure {
+                    object_key: object_key.to_owned(),
+                })
             }
         }
     }
@@ -230,62 +187,31 @@ impl Client {
     ///
     /// The object is streamed, so this also works for large files.
     pub async fn hash_object(&self, object_key: &str) -> Result<Sha256, StorageError> {
-        let read_error = |source: BoxError| StorageError::Read {
+        let read_error = |source: object_store::Error| StorageError::Read {
             object_key: object_key.to_owned(),
-            source,
+            source: source.into(),
         };
 
-        let mut response = self
-            .client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(object_key)
-            .send()
+        let mut stream = self
+            .store
+            .get(&ObjectPath::from(object_key))
             .await
-            .map_err(|e| read_error(e.into()))?;
+            .map_err(read_error)?
+            .into_stream();
 
         let mut hasher = Hasher::default();
-        while let Some(chunk) = response
-            .body
-            .try_next()
-            .await
-            .map_err(|e| read_error(e.into()))?
-        {
+        while let Some(chunk) = stream.try_next().await.map_err(read_error)? {
             hasher.update(&chunk);
         }
 
         Ok(hasher.finalize())
     }
 
-    /// Upload data to the persistent store. Doesn't update any channel.
-    async fn write_data(&self, object_key: &str, data: Vec<u8>) -> Result<(), StorageError> {
-        self.client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(object_key)
-            .body(data.into())
-            .send()
-            .await
-            .map_err(|e| StorageError::Upload {
-                object_key: object_key.to_owned(),
-                source: e.into(),
-            })?;
-
-        Ok(())
-    }
-
     /// Check whether an object exists in the bucket.
     pub async fn file_exists(&self, object_key: &str) -> Result<bool, StorageError> {
-        match self
-            .client
-            .head_object()
-            .bucket(&self.bucket)
-            .key(object_key)
-            .send()
-            .await
-        {
+        match self.store.head(&ObjectPath::from(object_key)).await {
             Ok(_) => Ok(true),
-            Err(err) if err.as_service_error().is_some_and(|e| e.is_not_found()) => Ok(false),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
             Err(err) => Err(StorageError::ExistenceCheck {
                 object_key: object_key.to_owned(),
                 source: err.into(),
@@ -295,8 +221,8 @@ impl Client {
 
     /// Upload a file to the bucket, using its file name as object key.
     ///
-    /// Refuses to overwrite existing objects. The file is hashed before it is
-    /// uploaded.
+    /// Refuses to overwrite existing objects. The file is streamed to the
+    /// bucket and hashed on the way.
     pub async fn upload_new_file(&self, file: &Path) -> Result<UploadedFile, StorageError> {
         let object_key = file
             .file_name()
@@ -310,22 +236,65 @@ impl Client {
             return Err(StorageError::AlreadyExists { object_key });
         }
 
-        // We would want to stream the file and not load it all in
-        // memory, but it results in XAmzContentSHA256Mismatch. :(
-        let data = tokio::fs::read(file)
+        let local_file_error = |source| StorageError::LocalFile {
+            path: file.to_owned(),
+            source,
+        };
+        let upload_error = |source: object_store::Error| StorageError::Upload {
+            object_key: object_key.clone(),
+            source: BoxError::from(source),
+        };
+
+        let mut local_file = tokio::fs::File::open(file)
             .await
-            .map_err(|source| StorageError::LocalFile {
-                path: file.to_owned(),
-                source,
-            })?;
+            .map_err(local_file_error)?;
+        let upload = self
+            .store
+            .put_multipart(&ObjectPath::from(object_key.as_str()))
+            .await
+            .map_err(upload_error)?;
+        let mut writer = WriteMultipart::new(upload);
 
         let mut hasher = Hasher::default();
-        hasher.update(&data);
-        let sha256 = hasher.finalize();
+        let mut buffer = vec![0; UPLOAD_CHUNK_SIZE];
 
-        self.write_data(&object_key, data).await?;
+        let copied: Result<(), StorageError> = async {
+            loop {
+                let read = local_file
+                    .read(&mut buffer)
+                    .await
+                    .map_err(local_file_error)?;
+                if read == 0 {
+                    return Ok(());
+                }
 
-        Ok(UploadedFile { object_key, sha256 })
+                hasher.update(&buffer[..read]);
+                writer
+                    .wait_for_capacity(UPLOAD_CONCURRENCY)
+                    .await
+                    .map_err(upload_error)?;
+                writer.write(&buffer[..read]);
+            }
+        }
+        .await;
+
+        match copied {
+            Ok(()) => {
+                writer.finish().await.map_err(upload_error)?;
+            }
+            Err(err) => {
+                // Don't leave the incomplete upload behind in the bucket.
+                if let Err(abort_err) = writer.abort().await {
+                    error!("Failed to abort upload of {object_key:?}: {abort_err}");
+                }
+                return Err(err);
+            }
+        }
+
+        Ok(UploadedFile {
+            object_key,
+            sha256: hasher.finalize(),
+        })
     }
 }
 
@@ -334,11 +303,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_http_date_works() {
-        assert_eq!(
-            parse_http_date("Wed, 21 Oct 2015 07:28:00 GMT"),
-            Some(DateTime::from_secs(1445412480))
-        );
+    fn http_dates_work() {
+        let date = DateTime::from_timestamp(1445412480, 0).unwrap();
+
+        assert_eq!(parse_http_date("Wed, 21 Oct 2015 07:28:00 GMT"), Some(date));
+        assert_eq!(format_http_date(date), "Wed, 21 Oct 2015 07:28:00 GMT");
 
         // Unparseable dates make the request unconditional.
         assert_eq!(parse_http_date("yesterday"), None);

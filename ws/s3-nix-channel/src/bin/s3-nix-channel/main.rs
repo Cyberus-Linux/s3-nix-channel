@@ -201,23 +201,19 @@ async fn handle_persistent(
     Ok(match fetched {
         Fetched::Found(object) => {
             insert(CONTENT_TYPE, object.content_type);
-            insert(CONTENT_LENGTH, object.content_length.map(|l| l.to_string()));
+            insert(CONTENT_LENGTH, Some(object.content_length.to_string()));
             insert(ETAG, object.etag);
-            insert(LAST_MODIFIED, object.last_modified);
+            insert(LAST_MODIFIED, Some(object.last_modified));
 
             let body = object
                 .body
-                .map(|stream| Body::new(stream.into_inner()))
+                .map(Body::from_stream)
                 .unwrap_or_else(Body::empty);
 
             (headers, body).into_response()
         }
-        Fetched::NotModified {
-            etag,
-            last_modified,
-        } => {
+        Fetched::NotModified { etag } => {
             insert(ETAG, etag);
-            insert(LAST_MODIFIED, last_modified);
 
             (StatusCode::NOT_MODIFIED, headers).into_response()
         }
@@ -238,7 +234,7 @@ async fn main() -> Result<()> {
 
     migration::Migrator::up(&db, None).await?;
 
-    let s3_client = storage::s3::Client::new_from_env(&args.bucket).await;
+    let s3_client = storage::s3::Client::new_from_env(&args.bucket)?;
 
     let config = Arc::new(Config {
         s3_client,

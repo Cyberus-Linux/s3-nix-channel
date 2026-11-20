@@ -7,9 +7,11 @@ license = "AGPL-3.0-or-later"
 publish = false
 
 [dependencies]
-aws-config = { version = "1.11.0", features = ["behavior-version-latest", "default-https-client", "rt-tokio"], default-features = false }
-aws-sdk-s3 = { version = "1.143.0", default-features = false, features = ["default-https-client", "rt-tokio", "sigv4a"] }
+bytes = "1.12.1"
+chrono = { version = "0.4.45", default-features = false, features = ["alloc"] }
+futures = { version = "0.3", default-features = false, features = ["std"] }
+object_store = { version = "0.14.2", default-features = false, features = ["aws"] }
 sha2 = "0.11.1"
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["fs"] }
+tokio = { workspace = true, features = ["fs", "io-util"] }
 tracing = { workspace = true }

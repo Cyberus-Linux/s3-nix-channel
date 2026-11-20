@@ -15,6 +15,8 @@ pub enum FetchError {
 /// Why reading, checking or uploading objects failed.
 #[derive(thiserror::Error, Debug)]
 pub enum StorageError {
+    #[error("Invalid S3 configuration")]
+    Configuration { source: BoxError },
     #[error("Failed to read {object_key:?} from the bucket")]
     Read {
         object_key: String,

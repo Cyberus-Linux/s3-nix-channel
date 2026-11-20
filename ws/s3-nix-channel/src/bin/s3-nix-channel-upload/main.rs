@@ -415,7 +415,7 @@ async fn main() -> Result<()> {
         } => {
             // Read the legacy configuration first, so a wrong bucket doesn't
             // touch the database.
-            let s3_client = Client::new_from_env(&bucket).await;
+            let s3_client = Client::new_from_env(&bucket)?;
             let config = legacy::load_channels_config(&s3_client).await?;
 
             import_legacy(
@@ -439,7 +439,7 @@ async fn main() -> Result<()> {
             file,
             force,
         } => {
-            let s3_client = Client::new_from_env(&bucket).await;
+            let s3_client = Client::new_from_env(&bucket)?;
             publish(&db().await?, &s3_client, &channel, &file, force).await?
         }
     }

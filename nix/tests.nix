@@ -12,6 +12,7 @@ let
     AWS_SECRET_ACCESS_KEY=${secretKey}
     AWS_REGION=${region}
     AWS_ENDPOINT_URL=http://s3:9000
+    AWS_ALLOW_HTTP=true
   '';
 
   tarball =
